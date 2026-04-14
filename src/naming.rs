@@ -41,6 +41,16 @@ fn is_leading_date_prefix(s: &str) -> bool {
     matches!(s.len(), 4 | 6) && s.chars().all(|c| c.is_ascii_digit())
 }
 
+/// If the stem’s first non-empty segment is a legacy `YYMM` or `YYMMDD` token (4 or 6 ASCII
+/// digits), returns that token’s **`YYMM`** (the first four characters). Otherwise `None`.
+pub fn leading_yymm_from_stem(stem: &str) -> Option<String> {
+    let first = stem.split('-').find(|s| !s.is_empty())?;
+    if !is_leading_date_prefix(first) {
+        return None;
+    }
+    Some(first[..4].to_string())
+}
+
 /// Legacy filenames used a 4-digit `YYMM` prefix; expand to `YYMMDD` with day `00` for new names.
 pub fn normalize_date_prefix_for_stem(prefix: &str) -> String {
     if prefix.len() == 4 && prefix.chars().all(|c| c.is_ascii_digit()) {
@@ -52,6 +62,31 @@ pub fn normalize_date_prefix_for_stem(prefix: &str) -> String {
 
 fn segment_is_ascii_digits(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Strips trailing `-<digits>` collision pieces, then if the stem begins with `YYMM` / `YYMMDD` and
+/// `capture_yymmdd` (embedded date) differs from that prefix after [`normalize_date_prefix_for_stem`],
+/// returns a new stem with the embedded `YYMMDD` substituted. Otherwise `None`.
+pub fn stem_with_embedded_capture_date(stem: &str, capture_yymmdd: &str) -> Option<String> {
+    if capture_yymmdd.len() != 6 || !capture_yymmdd.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut parts: Vec<&str> = stem.split('-').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() || !is_leading_date_prefix(parts[0]) {
+        return None;
+    }
+    while parts.len() > 1 && segment_is_ascii_digits(parts[parts.len() - 1]) {
+        parts.pop();
+    }
+    if parts.len() < 2 {
+        return None;
+    }
+    let on_disk = normalize_date_prefix_for_stem(parts[0]);
+    if on_disk == capture_yymmdd {
+        return None;
+    }
+    let tail = parts[1..].join("-");
+    Some(format!("{capture_yymmdd}-{tail}"))
 }
 
 /// How much of our `YYMMDD-Country-City[-Description][-N]` (or legacy `YYMM-…`) stem matches.
@@ -96,6 +131,24 @@ pub fn classify_tool_stem(stem: &str) -> ToolStemClass {
 /// [`ToolStemClass::FullyNamed`]).
 pub fn stem_matches_tool_naming_layout(stem: &str) -> bool {
     matches!(classify_tool_stem(stem), ToolStemClass::FullyNamed)
+}
+
+/// For [`ToolStemClass::FullyNamed`] stems: after stripping trailing `-<digits>` collision suffixes,
+/// returns `(date_prefix, description)` where `description` is the **last** segment. Middle segments
+/// (former country/city, including multi-segment place names) are discarded when rebuilding from
+/// fresh geocoding.
+pub fn parse_fully_named_stem_for_refresh(stem: &str) -> Option<(String, String)> {
+    let mut parts: Vec<&str> = stem.split('-').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() || !is_leading_date_prefix(parts[0]) {
+        return None;
+    }
+    while parts.len() > 1 && segment_is_ascii_digits(parts[parts.len() - 1]) {
+        parts.pop();
+    }
+    if parts.len() < 4 {
+        return None;
+    }
+    Some((parts[0].to_string(), parts[parts.len() - 1].to_string()))
 }
 
 /// After stripping trailing `-<digits>`, if the stem is exactly `YYMM-Country-City-Description` with
@@ -144,9 +197,7 @@ pub fn build_stem(
     }
     if base.len() > MAX_BASE_LEN {
         base.truncate(MAX_BASE_LEN);
-        base = base
-            .trim_end_matches(|ch| ch == '-' || ch == '_')
-            .to_string();
+        base = base.trim_end_matches(['-', '_']).to_string();
     }
     base
 }
@@ -227,6 +278,65 @@ mod tests {
     fn normalize_four_digit_prefix_appends_day_zero() {
         assert_eq!(normalize_date_prefix_for_stem("2603"), "260300");
         assert_eq!(normalize_date_prefix_for_stem("260314"), "260314");
+    }
+
+    #[test]
+    fn leading_yymm_from_stem_first_segment() {
+        assert_eq!(
+            leading_yymm_from_stem("2605-US-NYC-trip"),
+            Some("2605".into())
+        );
+        assert_eq!(
+            leading_yymm_from_stem("260514-Finland-Helsinki-beach"),
+            Some("2605".into())
+        );
+        assert_eq!(
+            leading_yymm_from_stem("2603-Finland-Helsinki"),
+            Some("2603".into())
+        );
+        assert_eq!(leading_yymm_from_stem("IMG_1234"), None);
+        assert_eq!(leading_yymm_from_stem("2605DD-US-NYC"), None);
+    }
+
+    #[test]
+    fn stem_with_embedded_capture_date_replaces_wrong_prefix() {
+        assert_eq!(
+            stem_with_embedded_capture_date("260500-Finland-Rautjärvi-trip", "260316"),
+            Some("260316-Finland-Rautjärvi-trip".into())
+        );
+        assert_eq!(
+            stem_with_embedded_capture_date("260500-Finland-Rautjärvi-trip-2", "260316"),
+            Some("260316-Finland-Rautjärvi-trip".into())
+        );
+        assert_eq!(
+            stem_with_embedded_capture_date("260316-Finland-Helsinki-beach", "260316"),
+            None
+        );
+        assert_eq!(
+            stem_with_embedded_capture_date("2603-Finland-Helsinki-trip", "260316"),
+            Some("260316-Finland-Helsinki-trip".into())
+        );
+    }
+
+    #[test]
+    fn parse_fully_named_stem_for_refresh_cases() {
+        assert_eq!(
+            parse_fully_named_stem_for_refresh("2504-US-NYC-beach"),
+            Some(("2504".into(), "beach".into()))
+        );
+        assert_eq!(
+            parse_fully_named_stem_for_refresh("2504-US-NYC-beach-2"),
+            Some(("2504".into(), "beach".into()))
+        );
+        assert_eq!(
+            parse_fully_named_stem_for_refresh("250415-US-NYC-my_trip"),
+            Some(("250415".into(), "my_trip".into()))
+        );
+        assert_eq!(
+            parse_fully_named_stem_for_refresh("260314-Finland-Helsinki"),
+            None
+        );
+        assert_eq!(parse_fully_named_stem_for_refresh("IMG_1234"), None);
     }
 
     #[test]

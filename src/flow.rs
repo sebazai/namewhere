@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use dialoguer::{theme::ColorfulTheme, Input, Password};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
 
 use crate::geoapify;
 use crate::gps;
@@ -15,6 +15,21 @@ use crate::naming;
 
 fn load_dotenv() {
     let _ = dotenvy::dotenv();
+}
+
+/// When set to `1` / `true` / `yes` / `on`, only files that already match fully named
+/// `YYMMDD-*-*-*-*` layout (and have GPS) are sent to Geoapify and renamed; the rest of the folder
+/// is left untouched.
+const ENV_REFRESH_GEAPIFY_ONLY: &str = "IMG_REVERSE_GEO_REFRESH_GEAPIFY_ONLY";
+
+fn env_truthy(key: &str) -> bool {
+    match env::var(key) {
+        Ok(s) => {
+            let t = s.trim().to_ascii_lowercase();
+            matches!(t.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    }
 }
 
 fn pick_folder() -> Result<PathBuf, String> {
@@ -74,6 +89,19 @@ fn parse_year_month() -> Result<(String, String), String> {
     let mm = format!("{m:02}");
 
     Ok((yymm_yy, mm))
+}
+
+/// After year/month: optionally ignore existing tool-style filenames and run GPS + Geoapify for every
+/// file with coordinates (no “already named” or stem-place skips).
+fn prompt_force_full_rerun() -> Result<bool, String> {
+    let theme = ColorfulTheme::default();
+    Confirm::with_theme(&theme)
+        .with_prompt(
+            "Force full rerun? (Ignore existing names — re-geocode all files with GPS; no already-named skips)",
+        )
+        .default(false)
+        .interact()
+        .map_err(|e| e.to_string())
 }
 
 /// Country or city: first file must be non-empty; later files may press Enter to reuse `last`.
@@ -212,6 +240,173 @@ struct FileWork {
     stem_date_override: Option<String>,
     /// Place is known from stem (`…-place-place` + numeric tail); do not rename in the geocoded-only pass.
     skip_initial_place_rename: bool,
+    /// Filename starts with `YYMM`/`YYMMDD` that disagrees with the session month; no embedded date
+    /// — skip all renames so the session fallback cannot override the name.
+    skip_session_date_mismatch: bool,
+}
+
+fn needs_geocode_place_validation(w: &FileWork, refresh_geocoding_only: bool) -> bool {
+    if w.skip_session_date_mismatch || w.place.is_none() {
+        return false;
+    }
+    if refresh_geocoding_only {
+        w.already_named
+    } else {
+        !w.already_named && !w.skip_initial_place_rename
+    }
+}
+
+fn validate_geocoded_places_before_rename(
+    work: &mut [FileWork],
+    refresh_geocoding_only: bool,
+) -> Result<(), String> {
+    let theme = ColorfulTheme::default();
+    let to_review: Vec<usize> = work
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| needs_geocode_place_validation(w, refresh_geocoding_only))
+        .map(|(i, _)| i)
+        .collect();
+
+    if to_review.is_empty() {
+        return Ok(());
+    }
+
+    println!(
+        "\n{} file(s) have place names from Geoapify (GPS). You can confirm or edit each before renaming{}.",
+        to_review.len(),
+        if refresh_geocoding_only {
+            " (refresh mode: fully named files)"
+        } else {
+            ""
+        }
+    );
+    let do_review = Confirm::with_theme(&theme)
+        .with_prompt("Review country/city for those files now?")
+        .default(true)
+        .interact()
+        .map_err(|e| e.to_string())?;
+
+    if !do_review {
+        return Ok(());
+    }
+
+    let total_review = to_review.len();
+    // Geoapify (country, city) → user-chosen pair; only applied when a file still has that Geoapify result.
+    let mut bulk_for_same_geoapify: HashMap<(String, String), (String, String)> = HashMap::new();
+    // After choosing "yes to all" for a Geoapify pair, accept that pair without prompting for matching files.
+    let mut auto_yes_same_geo: Option<(String, String)> = None;
+
+    for (i, &idx) in to_review.iter().enumerate() {
+        let w = &mut work[idx];
+        let name = w
+            .current_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+
+        if let Some(geo_key) = w.place.clone() {
+            if let Some((to_c, to_ci)) = bulk_for_same_geoapify.get(&geo_key) {
+                println!("\n--- {name} ---");
+                if let Some((lat, lon)) = gps::coordinates(&w.current_path) {
+                    println!("GPS: {lat:.6}, {lon:.6}");
+                }
+                println!(
+                    "Geoapify: {} / {}  →  using your saved place: {} / {}",
+                    geo_key.0, geo_key.1, to_c, to_ci
+                );
+                if let Err(e) = open::that(&w.current_path) {
+                    eprintln!("Could not open file (continuing): {e}");
+                }
+                w.place = Some((to_c.clone(), to_ci.clone()));
+                try_close_preview_best_effort();
+                continue;
+            }
+            if auto_yes_same_geo.as_ref() == Some(&geo_key) {
+                println!("\n--- {name} ---");
+                if let Some((lat, lon)) = gps::coordinates(&w.current_path) {
+                    println!("GPS: {lat:.6}, {lon:.6}");
+                }
+                println!(
+                    "Geoapify: {} / {}  →  accepting (yes to all for this Geoapify place)",
+                    geo_key.0, geo_key.1
+                );
+                if let Err(e) = open::that(&w.current_path) {
+                    eprintln!("Could not open file (continuing): {e}");
+                }
+                try_close_preview_best_effort();
+                continue;
+            }
+        }
+
+        let Some((country, city)) = w.place.clone() else {
+            continue;
+        };
+
+        println!("\n--- {name} ---");
+        if let Some((lat, lon)) = gps::coordinates(&w.current_path) {
+            println!("GPS: {lat:.6}, {lon:.6}");
+        }
+        println!("Geoapify: {country} / {city}");
+
+        if let Err(e) = open::that(&w.current_path) {
+            eprintln!("Could not open file (continuing): {e}");
+        }
+
+        let has_rest = i + 1 < total_review;
+        let sel = if has_rest {
+            let items = vec![
+                "Yes — this file only".to_string(),
+                "No — edit country / city".to_string(),
+                format!(
+                    "Yes — ALL remaining files with Geoapify \"{} / {}\"",
+                    country, city
+                ),
+            ];
+            Select::with_theme(&theme)
+                .with_prompt("Use this country and city in the filename? (↑/↓, Enter)")
+                .items(&items)
+                .default(0)
+                .interact()
+                .map_err(|e| e.to_string())?
+        } else {
+            let items = vec![
+                "Yes — use Geoapify place".to_string(),
+                "No — edit country / city".to_string(),
+            ];
+            Select::with_theme(&theme)
+                .with_prompt("Use this country and city in the filename? (↑/↓, Enter)")
+                .items(&items)
+                .default(0)
+                .interact()
+                .map_err(|e| e.to_string())?
+        };
+
+        if sel == 1 {
+            let c = prompt_place_line("Country", Some(&country))?;
+            let ci = prompt_place_line("City", Some(&city))?;
+            let from_geo = (country.clone(), city.clone());
+            w.place = Some((c.clone(), ci.clone()));
+            if has_rest {
+                let for_rest = Confirm::with_theme(&theme)
+                    .with_prompt(format!(
+                        "Use this country & city for all remaining files whose Geoapify place is still \"{} / {}\"?",
+                        from_geo.0, from_geo.1
+                    ))
+                    .default(true)
+                    .interact()
+                    .map_err(|e| e.to_string())?;
+                if for_rest {
+                    bulk_for_same_geoapify.insert(from_geo, (c, ci));
+                }
+            }
+        } else if has_rest && sel == 2 {
+            auto_yes_same_geo = Some((country.clone(), city.clone()));
+        }
+        try_close_preview_best_effort();
+    }
+
+    Ok(())
 }
 
 fn try_rename_with_stem(folder: &Path, w: &mut FileWork, stem: &str) -> Result<(), String> {
@@ -250,6 +445,13 @@ fn rename_place_only(folder: &Path, w: &mut FileWork) -> Result<(), String> {
 pub fn run() -> Result<(), String> {
     load_dotenv();
 
+    let refresh_geocoding_only = env_truthy(ENV_REFRESH_GEAPIFY_ONLY);
+    if refresh_geocoding_only {
+        println!(
+            "Refresh-only mode: {ENV_REFRESH_GEAPIFY_ONLY}=1 — only fully named YYMMDD-*-*-* files with GPS are reverse-geocoded; other files are left as-is."
+        );
+    }
+
     let folder = pick_folder()?;
     let files = media::list_media_files(&folder)?;
     if files.is_empty() {
@@ -270,6 +472,7 @@ pub fn run() -> Result<(), String> {
             date_prefix: String::new(),
             stem_date_override: None,
             skip_initial_place_rename: false,
+            skip_session_date_mismatch: false,
         });
     }
 
@@ -281,89 +484,196 @@ pub fn run() -> Result<(), String> {
     let yymm = format!("{yy}{mm}");
     let fallback_yymmdd = format!("{yymm}00");
 
-    for w in &mut work {
-        w.date_prefix =
-            gps::capture_yymmdd(&w.current_path).unwrap_or_else(|| fallback_yymmdd.clone());
-    }
-
-    for w in &mut work {
-        let Some(stem) = w.current_path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        match naming::classify_tool_stem(stem) {
-            naming::ToolStemClass::FullyNamed => {
-                w.already_named = true;
-            }
-            naming::ToolStemClass::PlaceOnlyNeedsDescription {
-                date_prefix,
-                country,
-                city,
-            } => {
-                w.place = Some((country, city));
-                w.stem_date_override = Some(date_prefix);
-                w.skip_initial_place_rename = true;
-            }
-            naming::ToolStemClass::NotRecognized => {}
-        }
-    }
-
-    let mut legacy_yymm_upgraded = 0_u32;
-    for w in &mut work {
-        if !w.already_named || !gps::is_probably_image(&w.current_path) {
-            continue;
-        }
-        let Some(stem) = w.current_path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Some((file_yymm, ref country, ref city, ref desc)) =
-            naming::parse_legacy_yymm_four_segment_stem(stem)
-        else {
-            continue;
-        };
-        let new_prefix =
-            gps::capture_yymmdd(&w.current_path).unwrap_or_else(|| format!("{file_yymm}00"));
-        let new_stem = naming::build_stem(&new_prefix, country, city, Some(desc.as_str()));
-        if new_stem == stem {
-            continue;
-        }
-        match try_rename_with_stem(&folder, w, &new_stem) {
-            Ok(()) => legacy_yymm_upgraded += 1,
-            Err(e) => eprintln!("Legacy YYMM→YYMMDD upgrade: {e}"),
-        }
-    }
-    if legacy_yymm_upgraded > 0 {
+    let force_full_rerun = if refresh_geocoding_only {
+        false
+    } else {
+        prompt_force_full_rerun()?
+    };
+    if force_full_rerun {
         println!(
-            "Upgraded {legacy_yymm_upgraded} legacy YYMM- image name(s) to YYMMDD- (EXIF capture date, or YYMM00 from the filename when missing)."
+            "Full rerun: ignoring filename layout — every file with GPS will be reverse-geocoded; session/YYMM mismatch skips are off."
         );
     }
 
-    let skip_count = work.iter().filter(|w| w.already_named).count();
-    let active_count = work.len().saturating_sub(skip_count);
-    if skip_count > 0 {
-        println!(
-            "{skip_count} file(s) already look like YYMMDD-*-*-* (or legacy YYMM-*-*-*; not necessarily session {yymm}); skipping API and renames:"
-        );
-        for w in work.iter().filter(|w| w.already_named) {
-            let fname = w
-                .current_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
-            let head = w
-                .current_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|st| st.split('-').find(|p| !p.is_empty()))
-                .unwrap_or("?");
-            println!("  • {fname} (prefix {head}-…)");
+    for w in &mut work {
+        let exif_or_video_date = gps::capture_yymmdd(&w.current_path);
+        w.date_prefix = exif_or_video_date
+            .clone()
+            .unwrap_or_else(|| fallback_yymmdd.clone());
+        if !force_full_rerun && exif_or_video_date.is_none() {
+            if let Some(stem) = w.current_path.file_stem().and_then(|s| s.to_str()) {
+                if let Some(ref file_yymm) = naming::leading_yymm_from_stem(stem) {
+                    if file_yymm != &yymm {
+                        w.skip_session_date_mismatch = true;
+                    }
+                }
+            }
         }
     }
 
-    println!(
-        "{} file(s) in folder; {} still go through GPS / geocoding / prompts (fallback date prefix {fallback_yymmdd} when EXIF/video date is missing).",
-        work.len(),
-        active_count
-    );
+    if !force_full_rerun {
+        for w in &mut work {
+            let Some(stem) = w.current_path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match naming::classify_tool_stem(stem) {
+                naming::ToolStemClass::FullyNamed => {
+                    w.already_named = true;
+                }
+                naming::ToolStemClass::PlaceOnlyNeedsDescription {
+                    date_prefix,
+                    country,
+                    city,
+                } => {
+                    w.place = Some((country, city));
+                    w.stem_date_override = Some(date_prefix);
+                    w.skip_initial_place_rename = true;
+                }
+                naming::ToolStemClass::NotRecognized => {}
+            }
+        }
+    }
+
+    if !refresh_geocoding_only && !force_full_rerun {
+        let mut legacy_yymm_upgraded = 0_u32;
+        for w in &mut work {
+            if w.skip_session_date_mismatch {
+                continue;
+            }
+            if !w.already_named || !gps::is_probably_image(&w.current_path) {
+                continue;
+            }
+            let Some(stem) = w.current_path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some((file_yymm, ref country, ref city, ref desc)) =
+                naming::parse_legacy_yymm_four_segment_stem(stem)
+            else {
+                continue;
+            };
+            let new_prefix =
+                gps::capture_yymmdd(&w.current_path).unwrap_or_else(|| format!("{file_yymm}00"));
+            let new_stem = naming::build_stem(&new_prefix, country, city, Some(desc.as_str()));
+            if new_stem == stem {
+                continue;
+            }
+            match try_rename_with_stem(&folder, w, &new_stem) {
+                Ok(()) => legacy_yymm_upgraded += 1,
+                Err(e) => eprintln!("Legacy YYMM→YYMMDD upgrade: {e}"),
+            }
+        }
+        if legacy_yymm_upgraded > 0 {
+            println!(
+                "Upgraded {legacy_yymm_upgraded} legacy YYMM- image name(s) to YYMMDD- (EXIF capture date, or YYMM00 from the filename when missing)."
+            );
+        }
+
+        let mut capture_date_stem_fixed = 0_u32;
+        for w in &mut work {
+            if w.skip_session_date_mismatch || !w.already_named {
+                continue;
+            }
+            let Some(stem) = w.current_path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some(capture) = gps::capture_yymmdd(&w.current_path) else {
+                continue;
+            };
+            let Some(new_stem) = naming::stem_with_embedded_capture_date(stem, &capture) else {
+                continue;
+            };
+            match try_rename_with_stem(&folder, w, &new_stem) {
+                Ok(()) => capture_date_stem_fixed += 1,
+                Err(e) => eprintln!("Embedded capture date vs filename prefix: {e}"),
+            }
+        }
+        if capture_date_stem_fixed > 0 {
+            println!(
+                "Renamed {capture_date_stem_fixed} already-named file(s) so the leading YYMMDD matches embedded capture date."
+            );
+        }
+    }
+
+    if refresh_geocoding_only {
+        let eligible = work
+            .iter()
+            .filter(|w| {
+                w.already_named
+                    && !w.skip_session_date_mismatch
+                    && gps::coordinates(&w.current_path).is_some()
+                    && w.current_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|st| naming::parse_fully_named_stem_for_refresh(st).is_some())
+            })
+            .count();
+        if eligible == 0 {
+            return Err(
+                "Refresh-only mode: no fully named YYMMDD-*-*-* files with GPS (or stems could not be parsed for refresh)."
+                    .into(),
+            );
+        }
+        println!(
+            "Refresh-only: {eligible} fully named file(s) with GPS will be reverse-geocoded; all other files are ignored for this run."
+        );
+    } else if force_full_rerun {
+        println!(
+            "{} file(s) in folder; full rerun — all with GPS go to Geoapify; others get prompts (fallback date prefix {fallback_yymmdd} when EXIF/video date is missing).",
+            work.len()
+        );
+    } else {
+        let skip_count = work.iter().filter(|w| w.already_named).count();
+        let mismatch_skip_count = work.iter().filter(|w| w.skip_session_date_mismatch).count();
+        let active_count = work
+            .len()
+            .saturating_sub(skip_count)
+            .saturating_sub(mismatch_skip_count);
+        if mismatch_skip_count > 0 {
+            println!(
+                "{mismatch_skip_count} file(s) skipped: filename starts with YYMM that is not session {yymm} (no embedded capture date); avoiding wrong renames:"
+            );
+            for w in work.iter().filter(|w| w.skip_session_date_mismatch) {
+                let fname = w
+                    .current_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let head = naming::leading_yymm_from_stem(
+                    w.current_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(""),
+                )
+                .unwrap_or_else(|| "?".into());
+                println!("  • {fname} (file YYMM {head}, session {yymm})");
+            }
+        }
+        if skip_count > 0 {
+            println!(
+                "{skip_count} file(s) already look like YYMMDD-*-*-* (or legacy YYMM-*-*-*; not necessarily session {yymm}); skipping API and renames:"
+            );
+            for w in work.iter().filter(|w| w.already_named) {
+                let fname = w
+                    .current_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let head = w
+                    .current_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|st| st.split('-').find(|p| !p.is_empty()))
+                    .unwrap_or("?");
+                println!("  • {fname} (prefix {head}-…)");
+            }
+        }
+
+        println!(
+            "{} file(s) in folder; {} still go through GPS / geocoding / prompts (fallback date prefix {fallback_yymmdd} when EXIF/video date is missing).",
+            work.len(),
+            active_count
+        );
+    }
     let _ = std::io::stdout().flush();
 
     println!("\nReading GPS and calling Geoapify where needed (videos can be slow)…");
@@ -378,7 +688,14 @@ pub fn run() -> Result<(), String> {
     let mut limiter = SlidingWindowRateLimiter::new(Duration::from_millis(1500), 5);
 
     for w in &mut work {
-        if w.already_named || w.place.is_some() {
+        if !force_full_rerun && w.skip_session_date_mismatch {
+            continue;
+        }
+        if refresh_geocoding_only {
+            if !w.already_named {
+                continue;
+            }
+        } else if !force_full_rerun && (w.already_named || w.place.is_some()) {
             continue;
         }
         let Some((lat, lon)) = gps::coordinates(&w.current_path) else {
@@ -397,7 +714,7 @@ pub fn run() -> Result<(), String> {
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        match geoapify::reverse_geocode(lat, lon, key.trim()) {
+        match geoapify::reverse_geocode(lat, lon, key.trim(), &name) {
             Ok(pair) => w.place = Some(pair),
             Err(e) => eprintln!("Geocoding failed for {name}: {e}"),
         }
@@ -405,9 +722,48 @@ pub fn run() -> Result<(), String> {
 
     println!("Done GPS / geocode pass.");
 
+    validate_geocoded_places_before_rename(&mut work, refresh_geocoding_only)?;
+
+    if refresh_geocoding_only {
+        println!("\n--- Renaming from refreshed Geoapify country/city ---");
+        for w in &mut work {
+            if !w.already_named || w.skip_session_date_mismatch {
+                continue;
+            }
+            let Some((country, city)) = w.place.clone() else {
+                continue;
+            };
+            let name = w
+                .current_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let Some(stem_str) = w.current_path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some((file_date, desc_seg)) = naming::parse_fully_named_stem_for_refresh(stem_str)
+            else {
+                eprintln!("Refresh: cannot parse stem for {name}; skipping rename.");
+                continue;
+            };
+            let stem_date = if gps::capture_yymmdd(&w.current_path).is_some() {
+                w.date_prefix.clone()
+            } else {
+                naming::normalize_date_prefix_for_stem(&file_date)
+            };
+            let desc_opt = (!desc_seg.is_empty()).then_some(desc_seg.as_str());
+            let new_stem = naming::build_stem(&stem_date, &country, &city, desc_opt);
+            if let Err(e) = try_rename_with_stem(&folder, w, &new_stem) {
+                eprintln!("{e}");
+            }
+        }
+        println!("Done refresh-only run.");
+        return Ok(());
+    }
+
     println!("\n--- Renaming geocoded files (YYMMDD-Country-City) ---");
     for w in &mut work {
-        if w.already_named {
+        if w.already_named || w.skip_session_date_mismatch {
             continue;
         }
         if w.place.is_some() && !w.skip_initial_place_rename {
@@ -421,7 +777,7 @@ pub fn run() -> Result<(), String> {
     let mut last_country: Option<String> = None;
     let mut last_city: Option<String> = None;
     for w in &mut work {
-        if w.already_named || w.place.is_some() {
+        if w.already_named || w.place.is_some() || w.skip_session_date_mismatch {
             continue;
         }
         let name = w
@@ -453,12 +809,22 @@ pub fn run() -> Result<(), String> {
     }
 
     println!("\n--- Descriptions (geocoded files only; optional) ---");
+    println!(
+        "Tip: if geocoding used a POI or bure number (e.g. Bure-30), choose “No” to set a better city or place before the description."
+    );
+    let desc_theme = ColorfulTheme::default();
     for w in &mut work {
         let name = w
             .current_path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
+        if w.skip_session_date_mismatch {
+            println!(
+                "\n--- {name} --- (filename YYMM ≠ session {yymm}, no embedded date; skipping)"
+            );
+            continue;
+        }
         if w.already_named {
             println!("\n--- {name} --- (already date-*-*-*; skipping)");
             continue;
@@ -473,14 +839,32 @@ pub fn run() -> Result<(), String> {
             eprintln!("Could not open file (continuing): {e}");
         }
 
+        if let Some((country, city)) = w.place.clone() {
+            println!("Geocoded place: {country} / {city}");
+            let keep = Confirm::with_theme(&desc_theme)
+                .with_prompt("Keep this country & city in the filename? (No = edit)")
+                .default(true)
+                .interact()
+                .map_err(|e| e.to_string())?;
+            if !keep {
+                let c = prompt_place_line("Country", Some(&country))?;
+                let ci = prompt_place_line("City", Some(&city))?;
+                w.place = Some((c, ci));
+            }
+        }
+
         let desc_opt = prompt_optional_description()?;
 
         let (country, city) = w.place.as_ref().expect("place set for geocoded files");
-        let stem_date = w
-            .stem_date_override
-            .as_deref()
-            .map(naming::normalize_date_prefix_for_stem)
-            .unwrap_or_else(|| w.date_prefix.clone());
+        // Prefer embedded capture date over the stem when both exist (stem can be a stale YYMM/YYMMDD).
+        let stem_date = if gps::capture_yymmdd(&w.current_path).is_some() {
+            w.date_prefix.clone()
+        } else {
+            w.stem_date_override
+                .as_deref()
+                .map(naming::normalize_date_prefix_for_stem)
+                .unwrap_or_else(|| w.date_prefix.clone())
+        };
         let stem = naming::build_stem(&stem_date, country, city, desc_opt.as_deref());
         match try_rename_with_stem(&folder, w, &stem) {
             Ok(()) => try_close_preview_best_effort(),
