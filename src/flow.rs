@@ -227,43 +227,77 @@ fn prompt_place_line(prompt: &str, last: Option<&str>) -> Result<String, String>
     }
 }
 
+/// Truncate for one-line terminal hints (Unicode-safe).
+fn truncate_for_hint(s: &str) -> String {
+    const MAX_CHARS: usize = 56;
+    let it = s.chars();
+    if it.clone().count() <= MAX_CHARS {
+        return s.to_string();
+    }
+    it.take(MAX_CHARS.saturating_sub(1)).collect::<String>() + "…"
+}
+
+/// `stem_trim` (from the filename) wins over `last_trim` when both are set for an empty line.
+/// `s` / `S` means no description. No pre-filled default in the input field so Enter is not
+/// overloaded with “delete the whole line to skip.”
+fn interpret_description_input(
+    raw: &str,
+    stem_trim: Option<&str>,
+    last_trim: Option<&str>,
+) -> Option<String> {
+    let t = raw.trim();
+    if t.eq_ignore_ascii_case("s") {
+        return None;
+    }
+    if t.is_empty() {
+        if let Some(s) = stem_trim {
+            return Some(s.to_string());
+        }
+        if let Some(l) = last_trim {
+            return Some(l.to_string());
+        }
+        return None;
+    }
+    Some(t.to_string())
+}
+
 /// `stem_default` (from the filename) wins over `last_description` when both are set.
 fn prompt_optional_description(
     stem_default: Option<&str>,
     last_description: Option<&str>,
 ) -> Result<Option<String>, String> {
     let theme = ColorfulTheme::default();
-    let has_stem_desc = stem_default.is_some_and(|s| !s.trim().is_empty());
-    let merged_default = stem_default
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            last_description
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-        });
-    let prompt = if !has_stem_desc && last_description.is_some() {
-        "Description (optional; Enter = repeat last)"
+    let stem_trim = stem_default.map(|s| s.trim()).filter(|s| !s.is_empty());
+    let last_trim = last_description.map(|s| s.trim()).filter(|s| !s.is_empty());
+
+    let has_stem = stem_trim.is_some();
+    let has_last = last_trim.is_some();
+
+    let prompt = if has_stem {
+        "Description (Enter = filename hint, s = none, or type new)"
+    } else if has_last {
+        "Description (Enter = repeat last, s = skip, or type new)"
     } else {
         "Description (optional, Enter to skip)"
     };
-    let mut input = Input::with_theme(&theme)
-        .with_prompt(prompt)
-        .allow_empty(true);
-    if let Some(d) = merged_default {
-        if !d.trim().is_empty() {
-            input = input.default(d);
+
+    if has_stem {
+        if let Some(s) = stem_trim {
+            eprintln!("  Filename hint: \"{}\"", truncate_for_hint(s));
+        }
+    } else if has_last {
+        if let Some(l) = last_trim {
+            eprintln!("  Last: \"{}\"", truncate_for_hint(l));
         }
     }
-    let description: String = input.interact_text().map_err(|e| e.to_string())?;
-    let t = description.trim();
-    Ok(if t.is_empty() {
-        None
-    } else {
-        Some(t.to_string())
-    })
+
+    let raw: String = Input::with_theme(&theme)
+        .with_prompt(prompt)
+        .allow_empty(true)
+        .interact_text()
+        .map_err(|e| e.to_string())?;
+
+    Ok(interpret_description_input(&raw, stem_trim, last_trim))
 }
 
 /// Prompt once when env has no key; empty input skips reverse geocoding for this run.
@@ -1422,5 +1456,48 @@ mod parse_year_month_tests {
         let (yy, mm) = parse_combined_year_month("26/4").unwrap();
         assert_eq!(yy, "26");
         assert_eq!(mm, "04");
+    }
+}
+
+#[cfg(test)]
+mod description_prompt_tests {
+    use super::interpret_description_input;
+
+    #[test]
+    fn empty_no_defaults_is_skip() {
+        assert_eq!(interpret_description_input("", None, None), None);
+    }
+
+    #[test]
+    fn s_always_skip() {
+        assert_eq!(
+            interpret_description_input("s", Some("stem"), Some("last")),
+            None
+        );
+        assert_eq!(interpret_description_input("S", None, Some("beach")), None);
+    }
+
+    #[test]
+    fn empty_prefers_stem_over_last() {
+        assert_eq!(
+            interpret_description_input("", Some("park"), Some("beach")),
+            Some("park".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_repeats_last() {
+        assert_eq!(
+            interpret_description_input("", None, Some("beach")),
+            Some("beach".to_string())
+        );
+    }
+
+    #[test]
+    fn typed_text_is_new_description() {
+        assert_eq!(
+            interpret_description_input("  cafe  ", None, Some("old")),
+            Some("cafe".to_string())
+        );
     }
 }
