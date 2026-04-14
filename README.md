@@ -2,7 +2,9 @@
 
 A small Rust CLI that renames photos and videos in a folder using **GPS coordinates** (reverse geocoded via [Geoapify](https://www.geoapify.com/)) or **manual place names** when no location metadata is present. Output names follow:
 
-`YYMM-Country-City[-Description].ext`
+`YYMMDD-Country-City[-Description].ext`
+
+The **date** is taken from **EXIF** (images) or **ffprobe** tags (videos) when possible. If there is no usable capture date, the tool uses the year and month you enter plus **`00`** for the day (e.g. session April 2026 → `260400-…`). Legacy files that still use a **4-digit** `YYMM-…` prefix are recognized for skip / resume behavior. On each run, **images** that are skipped as fully named in the legacy `YYMM-Country-City-Description` shape (four dash segments, after stripping a trailing `-2` collision suffix) are **re-typed** to `YYMMDD-…` using EXIF capture date when present, or **`YYMM00-…`** from the filename’s month when not.
 
 The scan is **one folder only** (not recursive). Files are opened in your default viewer before you enter an optional description.
 
@@ -11,7 +13,7 @@ The scan is **one folder only** (not recursive). Files are opened in your defaul
 Images: `jpg`, `jpeg`, `png`, `gif`, `webp`, `heic`, `tif`, `tiff`  
 Videos: `mp4`, `mov`, `m4v`, `avi`, `mkv`
 
-GPS comes from **EXIF** on images and from **ffprobe** (ffmpeg) on video metadata.
+GPS and capture dates come from **EXIF** on images and from **ffprobe** (ffmpeg) on video metadata.
 
 ## Requirements
 
@@ -34,7 +36,7 @@ GPS comes from **EXIF** on images and from **ffprobe** (ffmpeg) on video metadat
    cargo run --release
    ```
 
-The program is **interactive**: it asks for a folder (native picker when available, otherwise a path in the terminal), then year and month for the `YYMM` prefix, then walks each media file in that folder.
+The program is **interactive**: it asks for a folder (native picker when available, otherwise a path in the terminal), then year and month used as **`YYMM00`** when a file has no embedded date, then walks each media file in that folder.
 
 ## Development
 

@@ -60,7 +60,7 @@ fn parse_year_month() -> Result<(String, String), String> {
     let yymm_yy = format!("{yy:02}");
 
     let month_in: String = Input::with_theme(&theme)
-        .with_prompt("Month (1-12)")
+        .with_prompt("Month (1-12; used as YYMM00 when file has no EXIF/video date)")
         .interact_text()
         .map_err(|e| e.to_string())?;
 
@@ -202,10 +202,16 @@ impl SlidingWindowRateLimiter {
 struct FileWork {
     current_path: PathBuf,
     place: Option<(String, String)>,
-    /// `NNNN-*-*-*` naming shape (four-digit YYMM in the file + three segments); skip API and renames.
+    /// `YYMMDD-*-*-*` (or legacy `YYMM-*-*-*`) on disk; skip API and renames.
     already_named: bool,
     /// Manual place + description done in one pass; skip the later description-only pass.
     manual_flow_complete: bool,
+    /// `YYMMDD` from EXIF/ffprobe, or session `YYMM` + `00` when unknown.
+    date_prefix: String,
+    /// Leading date token from the existing filename (legacy 4-digit or 6-digit).
+    stem_date_override: Option<String>,
+    /// Place is known from stem (`…-place-place` + numeric tail); do not rename in the geocoded-only pass.
+    skip_initial_place_rename: bool,
 }
 
 fn try_rename_with_stem(folder: &Path, w: &mut FileWork, stem: &str) -> Result<(), String> {
@@ -232,12 +238,12 @@ fn try_rename_with_stem(folder: &Path, w: &mut FileWork, stem: &str) -> Result<(
     Ok(())
 }
 
-fn rename_place_only(folder: &Path, yymm: &str, w: &mut FileWork) -> Result<(), String> {
+fn rename_place_only(folder: &Path, w: &mut FileWork) -> Result<(), String> {
     let (country, city) = w
         .place
         .as_ref()
         .ok_or_else(|| "internal: missing country/city".to_string())?;
-    let stem = naming::build_stem(yymm, country, city, None);
+    let stem = naming::build_stem(&w.date_prefix, country, city, None);
     try_rename_with_stem(folder, w, &stem)
 }
 
@@ -261,6 +267,9 @@ pub fn run() -> Result<(), String> {
             place: None,
             already_named: false,
             manual_flow_complete: false,
+            date_prefix: String::new(),
+            stem_date_override: None,
+            skip_initial_place_rename: false,
         });
     }
 
@@ -270,21 +279,69 @@ pub fn run() -> Result<(), String> {
 
     let (yy, mm) = parse_year_month()?;
     let yymm = format!("{yy}{mm}");
+    let fallback_yymmdd = format!("{yymm}00");
+
+    for w in &mut work {
+        w.date_prefix =
+            gps::capture_yymmdd(&w.current_path).unwrap_or_else(|| fallback_yymmdd.clone());
+    }
 
     for w in &mut work {
         let Some(stem) = w.current_path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        if naming::stem_matches_tool_naming_layout(stem) {
-            w.already_named = true;
+        match naming::classify_tool_stem(stem) {
+            naming::ToolStemClass::FullyNamed => {
+                w.already_named = true;
+            }
+            naming::ToolStemClass::PlaceOnlyNeedsDescription {
+                date_prefix,
+                country,
+                city,
+            } => {
+                w.place = Some((country, city));
+                w.stem_date_override = Some(date_prefix);
+                w.skip_initial_place_rename = true;
+            }
+            naming::ToolStemClass::NotRecognized => {}
         }
+    }
+
+    let mut legacy_yymm_upgraded = 0_u32;
+    for w in &mut work {
+        if !w.already_named || !gps::is_probably_image(&w.current_path) {
+            continue;
+        }
+        let Some(stem) = w.current_path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some((file_yymm, ref country, ref city, ref desc)) =
+            naming::parse_legacy_yymm_four_segment_stem(stem)
+        else {
+            continue;
+        };
+        let new_prefix =
+            gps::capture_yymmdd(&w.current_path).unwrap_or_else(|| format!("{file_yymm}00"));
+        let new_stem = naming::build_stem(&new_prefix, country, city, Some(desc.as_str()));
+        if new_stem == stem {
+            continue;
+        }
+        match try_rename_with_stem(&folder, w, &new_stem) {
+            Ok(()) => legacy_yymm_upgraded += 1,
+            Err(e) => eprintln!("Legacy YYMM→YYMMDD upgrade: {e}"),
+        }
+    }
+    if legacy_yymm_upgraded > 0 {
+        println!(
+            "Upgraded {legacy_yymm_upgraded} legacy YYMM- image name(s) to YYMMDD- (EXIF capture date, or YYMM00 from the filename when missing)."
+        );
     }
 
     let skip_count = work.iter().filter(|w| w.already_named).count();
     let active_count = work.len().saturating_sub(skip_count);
     if skip_count > 0 {
         println!(
-            "{skip_count} file(s) already look like YYMM-*-*-* (leading token is any 4 digits, not necessarily {yymm}); skipping API and renames:"
+            "{skip_count} file(s) already look like YYMMDD-*-*-* (or legacy YYMM-*-*-*; not necessarily session {yymm}); skipping API and renames:"
         );
         for w in work.iter().filter(|w| w.already_named) {
             let fname = w
@@ -303,7 +360,7 @@ pub fn run() -> Result<(), String> {
     }
 
     println!(
-        "{} file(s) in folder; {} still go through GPS / geocoding / prompts (session YYMM {yymm}).",
+        "{} file(s) in folder; {} still go through GPS / geocoding / prompts (fallback date prefix {fallback_yymmdd} when EXIF/video date is missing).",
         work.len(),
         active_count
     );
@@ -348,13 +405,13 @@ pub fn run() -> Result<(), String> {
 
     println!("Done GPS / geocode pass.");
 
-    println!("\n--- Renaming geocoded files (YYMM-Country-City) ---");
+    println!("\n--- Renaming geocoded files (YYMMDD-Country-City) ---");
     for w in &mut work {
         if w.already_named {
             continue;
         }
-        if w.place.is_some() {
-            if let Err(e) = rename_place_only(&folder, &yymm, w) {
+        if w.place.is_some() && !w.skip_initial_place_rename {
+            if let Err(e) = rename_place_only(&folder, w) {
                 eprintln!("{e}");
             }
         }
@@ -385,7 +442,7 @@ pub fn run() -> Result<(), String> {
         w.place = Some((country.clone(), city.clone()));
 
         let desc_opt = prompt_optional_description()?;
-        let stem = naming::build_stem(&yymm, &country, &city, desc_opt.as_deref());
+        let stem = naming::build_stem(&w.date_prefix, &country, &city, desc_opt.as_deref());
         match try_rename_with_stem(&folder, w, &stem) {
             Ok(()) => {
                 w.manual_flow_complete = true;
@@ -403,7 +460,7 @@ pub fn run() -> Result<(), String> {
             .unwrap_or_default()
             .to_string_lossy();
         if w.already_named {
-            println!("\n--- {name} --- (already YYMM-*-*-*; skipping)");
+            println!("\n--- {name} --- (already date-*-*-*; skipping)");
             continue;
         }
         if w.manual_flow_complete {
@@ -419,7 +476,12 @@ pub fn run() -> Result<(), String> {
         let desc_opt = prompt_optional_description()?;
 
         let (country, city) = w.place.as_ref().expect("place set for geocoded files");
-        let stem = naming::build_stem(&yymm, country, city, desc_opt.as_deref());
+        let stem_date = w
+            .stem_date_override
+            .as_deref()
+            .map(naming::normalize_date_prefix_for_stem)
+            .unwrap_or_else(|| w.date_prefix.clone());
+        let stem = naming::build_stem(&stem_date, country, city, desc_opt.as_deref());
         match try_rename_with_stem(&folder, w, &stem) {
             Ok(()) => try_close_preview_best_effort(),
             Err(e) => eprintln!("{e}"),
