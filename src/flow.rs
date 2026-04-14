@@ -133,13 +133,18 @@ fn prompt_place_line(prompt: &str, last: Option<&str>) -> Result<String, String>
     }
 }
 
-fn prompt_optional_description() -> Result<Option<String>, String> {
+fn prompt_optional_description(default: Option<&str>) -> Result<Option<String>, String> {
     let theme = ColorfulTheme::default();
-    let description: String = Input::with_theme(&theme)
+    let mut input = Input::with_theme(&theme)
         .with_prompt("Description (optional, Enter to skip)")
-        .allow_empty(true)
-        .interact_text()
-        .map_err(|e| e.to_string())?;
+        .allow_empty(true);
+    if let Some(d) = default {
+        let t = d.trim();
+        if !t.is_empty() {
+            input = input.default(t.to_string());
+        }
+    }
+    let description: String = input.interact_text().map_err(|e| e.to_string())?;
     let t = description.trim();
     Ok(if t.is_empty() {
         None
@@ -243,6 +248,34 @@ struct FileWork {
     /// Filename starts with `YYMM`/`YYMMDD` that disagrees with the session month; no embedded date
     /// — skip all renames so the session fallback cannot override the name.
     skip_session_date_mismatch: bool,
+    /// Full-rerun mode: `(country, city, optional description)` parsed from the existing stem for prompt defaults.
+    stem_placeholders: Option<(String, String, Option<String>)>,
+}
+
+/// How many files would call Geoapify if an API key is available (same filters as the geocode pass).
+fn geoapify_candidate_count(
+    work: &[FileWork],
+    force_full_rerun: bool,
+    refresh_geocoding_only: bool,
+) -> usize {
+    let mut n = 0;
+    for w in work {
+        if !force_full_rerun && w.skip_session_date_mismatch {
+            continue;
+        }
+        if refresh_geocoding_only {
+            if !w.already_named {
+                continue;
+            }
+        } else if !force_full_rerun && (w.already_named || w.place.is_some()) {
+            continue;
+        }
+        if gps::coordinates(&w.current_path).is_none() {
+            continue;
+        }
+        n += 1;
+    }
+    n
 }
 
 fn needs_geocode_place_validation(w: &FileWork, refresh_geocoding_only: bool) -> bool {
@@ -383,8 +416,12 @@ fn validate_geocoded_places_before_rename(
         };
 
         if sel == 1 {
-            let c = prompt_place_line("Country", Some(&country))?;
-            let ci = prompt_place_line("City", Some(&city))?;
+            let (def_c, def_ci) = match &w.stem_placeholders {
+                Some((sc, sci, _)) => (sc.as_str(), sci.as_str()),
+                None => (country.as_str(), city.as_str()),
+            };
+            let c = prompt_place_line("Country", Some(def_c))?;
+            let ci = prompt_place_line("City", Some(def_ci))?;
             let from_geo = (country.clone(), city.clone());
             w.place = Some((c.clone(), ci.clone()));
             if has_rest {
@@ -473,6 +510,7 @@ pub fn run() -> Result<(), String> {
             stem_date_override: None,
             skip_initial_place_rename: false,
             skip_session_date_mismatch: false,
+            stem_placeholders: None,
         });
     }
 
@@ -493,6 +531,11 @@ pub fn run() -> Result<(), String> {
         println!(
             "Full rerun: ignoring filename layout — every file with GPS will be reverse-geocoded; session/YYMM mismatch skips are off."
         );
+        for w in &mut work {
+            if let Some(stem) = w.current_path.file_stem().and_then(|s| s.to_str()) {
+                w.stem_placeholders = naming::parse_stem_placeholders(stem);
+            }
+        }
     }
 
     for w in &mut work {
@@ -687,6 +730,9 @@ pub fn run() -> Result<(), String> {
     let mut prompted_for_api_key = false;
     let mut limiter = SlidingWindowRateLimiter::new(Duration::from_millis(1500), 5);
 
+    let geoapify_total = geoapify_candidate_count(&work, force_full_rerun, refresh_geocoding_only);
+    let mut geoapify_index = 0usize;
+
     for w in &mut work {
         if !force_full_rerun && w.skip_session_date_mismatch {
             continue;
@@ -709,13 +755,20 @@ pub fn run() -> Result<(), String> {
             continue;
         };
         limiter.acquire();
+        geoapify_index += 1;
         let name = w
             .current_path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
+        println!("Geoapify [{geoapify_index}/{geoapify_total}] {name} — requesting…");
+        let _ = std::io::stdout().flush();
         match geoapify::reverse_geocode(lat, lon, key.trim(), &name) {
-            Ok(pair) => w.place = Some(pair),
+            Ok(pair) => {
+                let (ref country, ref city) = pair;
+                println!("  → {country} / {city}");
+                w.place = Some(pair);
+            }
             Err(e) => eprintln!("Geocoding failed for {name}: {e}"),
         }
     }
@@ -791,13 +844,27 @@ pub fn run() -> Result<(), String> {
             eprintln!("Could not open file (continuing): {e}");
         }
 
-        let country = prompt_place_line("Country", last_country.as_deref())?;
-        let city = prompt_place_line("City", last_city.as_deref())?;
+        let country = prompt_place_line(
+            "Country",
+            last_country
+                .as_deref()
+                .or_else(|| w.stem_placeholders.as_ref().map(|s| s.0.as_str())),
+        )?;
+        let city = prompt_place_line(
+            "City",
+            last_city
+                .as_deref()
+                .or_else(|| w.stem_placeholders.as_ref().map(|s| s.1.as_str())),
+        )?;
         last_country = Some(country.clone());
         last_city = Some(city.clone());
         w.place = Some((country.clone(), city.clone()));
 
-        let desc_opt = prompt_optional_description()?;
+        let desc_opt = prompt_optional_description(
+            w.stem_placeholders
+                .as_ref()
+                .and_then(|(_, _, d)| d.as_deref()),
+        )?;
         let stem = naming::build_stem(&w.date_prefix, &country, &city, desc_opt.as_deref());
         match try_rename_with_stem(&folder, w, &stem) {
             Ok(()) => {
@@ -847,13 +914,27 @@ pub fn run() -> Result<(), String> {
                 .interact()
                 .map_err(|e| e.to_string())?;
             if !keep {
-                let c = prompt_place_line("Country", Some(&country))?;
-                let ci = prompt_place_line("City", Some(&city))?;
+                let def_c = w
+                    .stem_placeholders
+                    .as_ref()
+                    .map(|s| s.0.as_str())
+                    .unwrap_or(country.as_str());
+                let def_ci = w
+                    .stem_placeholders
+                    .as_ref()
+                    .map(|s| s.1.as_str())
+                    .unwrap_or(city.as_str());
+                let c = prompt_place_line("Country", Some(def_c))?;
+                let ci = prompt_place_line("City", Some(def_ci))?;
                 w.place = Some((c, ci));
             }
         }
 
-        let desc_opt = prompt_optional_description()?;
+        let desc_opt = prompt_optional_description(
+            w.stem_placeholders
+                .as_ref()
+                .and_then(|(_, _, d)| d.as_deref()),
+        )?;
 
         let (country, city) = w.place.as_ref().expect("place set for geocoded files");
         // Prefer embedded capture date over the stem when both exist (stem can be a stale YYMM/YYMMDD).

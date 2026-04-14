@@ -64,6 +64,34 @@ fn segment_is_ascii_digits(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Best-effort parse of an existing tool-style stem for **defaults** when re-running with
+/// “force full rerun”: after a `YYMM` / `YYMMDD` date prefix, the next segment is **country**,
+/// the **last** segment (after stripping trailing `-<digits>` collision suffixes) is **description**
+/// when there are at least four segments; everything between country and description is **city**
+/// (joined with `-` if multiple segments). If only one segment follows country, that segment is
+/// **city** and there is no description.
+///
+/// Returns `None` if the stem does not look like `DATE-…` with at least country + city.
+pub fn parse_stem_placeholders(stem: &str) -> Option<(String, String, Option<String>)> {
+    let mut parts: Vec<&str> = stem.split('-').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() || !is_leading_date_prefix(parts[0]) {
+        return None;
+    }
+    while parts.len() > 1 && segment_is_ascii_digits(parts[parts.len() - 1]) {
+        parts.pop();
+    }
+    if parts.len() < 3 {
+        return None;
+    }
+    let country = parts[1].to_string();
+    if parts.len() == 3 {
+        return Some((country, parts[2].to_string(), None));
+    }
+    let description = parts[parts.len() - 1].to_string();
+    let city = parts[2..parts.len() - 1].join("-");
+    Some((country, city, Some(description)))
+}
+
 /// Strips trailing `-<digits>` collision pieces, then if the stem begins with `YYMM` / `YYMMDD` and
 /// `capture_yymmdd` (embedded date) differs from that prefix after [`normalize_date_prefix_for_stem`],
 /// returns a new stem with the embedded `YYMMDD` substituted. Otherwise `None`.
@@ -337,6 +365,28 @@ mod tests {
             None
         );
         assert_eq!(parse_fully_named_stem_for_refresh("IMG_1234"), None);
+    }
+
+    #[test]
+    fn parse_stem_placeholders_cases() {
+        assert_eq!(
+            parse_stem_placeholders("260409-Fiji-Nadi-kuitti"),
+            Some(("Fiji".into(), "Nadi".into(), Some("kuitti".into())))
+        );
+        assert_eq!(
+            parse_stem_placeholders("260409-Fiji-Nadi-kuitti-2"),
+            Some(("Fiji".into(), "Nadi".into(), Some("kuitti".into())))
+        );
+        assert_eq!(
+            parse_stem_placeholders("260409-Fiji-Dive-Shop-lisko"),
+            Some(("Fiji".into(), "Dive-Shop".into(), Some("lisko".into())))
+        );
+        assert_eq!(
+            parse_stem_placeholders("260409-Fiji-Nadi"),
+            Some(("Fiji".into(), "Nadi".into(), None))
+        );
+        assert_eq!(parse_stem_placeholders("IMG_1234"), None);
+        assert_eq!(parse_stem_placeholders("260409-Fiji"), None);
     }
 
     #[test]
