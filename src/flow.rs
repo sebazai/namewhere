@@ -227,15 +227,34 @@ fn prompt_place_line(prompt: &str, last: Option<&str>) -> Result<String, String>
     }
 }
 
-fn prompt_optional_description(default: Option<&str>) -> Result<Option<String>, String> {
+/// `stem_default` (from the filename) wins over `last_description` when both are set.
+fn prompt_optional_description(
+    stem_default: Option<&str>,
+    last_description: Option<&str>,
+) -> Result<Option<String>, String> {
     let theme = ColorfulTheme::default();
+    let has_stem_desc = stem_default.is_some_and(|s| !s.trim().is_empty());
+    let merged_default = stem_default
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            last_description
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        });
+    let prompt = if !has_stem_desc && last_description.is_some() {
+        "Description (optional; Enter = repeat last)"
+    } else {
+        "Description (optional, Enter to skip)"
+    };
     let mut input = Input::with_theme(&theme)
-        .with_prompt("Description (optional, Enter to skip)")
+        .with_prompt(prompt)
         .allow_empty(true);
-    if let Some(d) = default {
-        let t = d.trim();
-        if !t.is_empty() {
-            input = input.default(t.to_string());
+    if let Some(d) = merged_default {
+        if !d.trim().is_empty() {
+            input = input.default(d);
         }
     }
     let description: String = input.interact_text().map_err(|e| e.to_string())?;
@@ -263,11 +282,12 @@ fn prompt_geoapify_api_key() -> Result<Option<String>, String> {
     })
 }
 
-/// Best-effort: close the front Preview document on macOS. Other platforms / default apps are not
-/// controllable after `open::that` (no process handle).
-fn try_close_preview_best_effort() {
+/// Best-effort: dismiss the viewer opened for `opened_path`. macOS: close front Preview document.
+/// Linux: `wmctrl -c` by window title basename (works for some viewers). Other platforms: no-op.
+fn try_close_preview_best_effort(opened_path: &Path) {
     #[cfg(target_os = "macos")]
     {
+        let _ = opened_path;
         let script = r#"
 tell application "Preview"
     if (count of documents) > 0 then
@@ -279,6 +299,18 @@ end tell
             .arg("-e")
             .arg(script)
             .status();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(name) = opened_path.file_name().and_then(|s| s.to_str()) {
+            let _ = std::process::Command::new("wmctrl")
+                .args(["-c", name])
+                .status();
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = opened_path;
     }
 }
 
@@ -400,12 +432,17 @@ fn finalize_non_refresh_geocoded_file(
     w: &mut FileWork,
     folder: &Path,
     log: &mut RenameLog,
+    last_description: &mut Option<String>,
 ) -> Result<(), String> {
     let desc_opt = prompt_optional_description(
         w.stem_placeholders
             .as_ref()
             .and_then(|(_, _, d)| d.as_deref()),
+        last_description.as_deref(),
     )?;
+    if let Some(ref d) = desc_opt {
+        *last_description = Some(d.clone());
+    }
     let stem_date = stem_date_for_final_rename(w);
     let (country, city) = w
         .place
@@ -451,12 +488,19 @@ fn refresh_place_review_and_rename(
     log: &mut RenameLog,
 ) -> Result<(), String> {
     let theme = ColorfulTheme::default();
-    let to_review: Vec<usize> = work
+    let mut to_review: Vec<usize> = work
         .iter()
         .enumerate()
         .filter(|(_, w)| needs_geocode_place_validation(w, true))
         .map(|(i, _)| i)
         .collect();
+
+    to_review.sort_by(|&a, &b| {
+        work[a]
+            .date_prefix
+            .cmp(&work[b].date_prefix)
+            .then_with(|| work[a].current_path.cmp(&work[b].current_path))
+    });
 
     if to_review.is_empty() {
         return Ok(());
@@ -478,7 +522,12 @@ fn refresh_place_review_and_rename(
             if w.user_skip_rename {
                 continue;
             }
+            let open_path = w.current_path.clone();
+            if let Err(e) = open::that(&open_path) {
+                eprintln!("Could not open file (continuing): {e}");
+            }
             try_refresh_rename_one(w, folder, log)?;
+            try_close_preview_best_effort(&open_path);
         }
         return Ok(());
     }
@@ -508,12 +557,13 @@ fn refresh_place_review_and_rename(
                     "Geoapify: {} / {}  →  using your saved place: {} / {}",
                     geo_key.0, geo_key.1, to_c, to_ci
                 );
-                if let Err(e) = open::that(&w.current_path) {
+                let open_path = w.current_path.clone();
+                if let Err(e) = open::that(&open_path) {
                     eprintln!("Could not open file (continuing): {e}");
                 }
                 w.place = Some((to_c.clone(), to_ci.clone()));
                 try_refresh_rename_one(w, folder, log)?;
-                try_close_preview_best_effort();
+                try_close_preview_best_effort(&open_path);
                 continue;
             }
             if auto_yes_same_geo.as_ref() == Some(&geo_key) {
@@ -525,11 +575,12 @@ fn refresh_place_review_and_rename(
                     "Geoapify: {} / {}  →  accepting (yes to all for this Geoapify place)",
                     geo_key.0, geo_key.1
                 );
-                if let Err(e) = open::that(&w.current_path) {
+                let open_path = w.current_path.clone();
+                if let Err(e) = open::that(&open_path) {
                     eprintln!("Could not open file (continuing): {e}");
                 }
                 try_refresh_rename_one(w, folder, log)?;
-                try_close_preview_best_effort();
+                try_close_preview_best_effort(&open_path);
                 continue;
             }
         }
@@ -544,7 +595,8 @@ fn refresh_place_review_and_rename(
         }
         println!("Geoapify: {country} / {city}");
 
-        if let Err(e) = open::that(&w.current_path) {
+        let open_path = w.current_path.clone();
+        if let Err(e) = open::that(&open_path) {
             eprintln!("Could not open file (continuing): {e}");
         }
 
@@ -581,12 +633,12 @@ fn refresh_place_review_and_rename(
 
         if has_rest && sel == 3 {
             w.user_skip_rename = true;
-            try_close_preview_best_effort();
+            try_close_preview_best_effort(&open_path);
             continue;
         }
         if !has_rest && sel == 2 {
             w.user_skip_rename = true;
-            try_close_preview_best_effort();
+            try_close_preview_best_effort(&open_path);
             continue;
         }
 
@@ -616,13 +668,13 @@ fn refresh_place_review_and_rename(
         } else if has_rest && sel == 2 {
             auto_yes_same_geo = Some((country.clone(), city.clone()));
             try_refresh_rename_one(w, folder, log)?;
-            try_close_preview_best_effort();
+            try_close_preview_best_effort(&open_path);
             continue;
         } else {
             try_refresh_rename_one(w, folder, log)?;
         }
 
-        try_close_preview_best_effort();
+        try_close_preview_best_effort(&open_path);
     }
 
     Ok(())
@@ -634,12 +686,19 @@ fn geocoded_interactive_place_desc_rename(
     log: &mut RenameLog,
 ) -> Result<(), String> {
     let theme = ColorfulTheme::default();
-    let to_review: Vec<usize> = work
+    let mut to_review: Vec<usize> = work
         .iter()
         .enumerate()
         .filter(|(_, w)| needs_geocode_place_validation(w, false))
         .map(|(i, _)| i)
         .collect();
+
+    to_review.sort_by(|&a, &b| {
+        work[a]
+            .date_prefix
+            .cmp(&work[b].date_prefix)
+            .then_with(|| work[a].current_path.cmp(&work[b].current_path))
+    });
 
     if to_review.is_empty() {
         return Ok(());
@@ -655,13 +714,20 @@ fn geocoded_interactive_place_desc_rename(
         .interact()
         .map_err(|e| e.to_string())?;
 
+    let mut last_description: Option<String> = None;
+
     if !do_review {
         for &idx in &to_review {
             let w = &mut work[idx];
             if w.user_skip_rename {
                 continue;
             }
-            finalize_non_refresh_geocoded_file(w, folder, log)?;
+            let open_path = w.current_path.clone();
+            if let Err(e) = open::that(&open_path) {
+                eprintln!("Could not open file (continuing): {e}");
+            }
+            finalize_non_refresh_geocoded_file(w, folder, log, &mut last_description)?;
+            try_close_preview_best_effort(&open_path);
         }
         return Ok(());
     }
@@ -691,12 +757,13 @@ fn geocoded_interactive_place_desc_rename(
                     "Geoapify: {} / {}  →  using your saved place: {} / {}",
                     geo_key.0, geo_key.1, to_c, to_ci
                 );
-                if let Err(e) = open::that(&w.current_path) {
+                let open_path = w.current_path.clone();
+                if let Err(e) = open::that(&open_path) {
                     eprintln!("Could not open file (continuing): {e}");
                 }
                 w.place = Some((to_c.clone(), to_ci.clone()));
-                finalize_non_refresh_geocoded_file(w, folder, log)?;
-                try_close_preview_best_effort();
+                finalize_non_refresh_geocoded_file(w, folder, log, &mut last_description)?;
+                try_close_preview_best_effort(&open_path);
                 continue;
             }
             if auto_yes_same_geo.as_ref() == Some(&geo_key) {
@@ -708,11 +775,12 @@ fn geocoded_interactive_place_desc_rename(
                     "Geoapify: {} / {}  →  accepting (yes to all for this Geoapify place)",
                     geo_key.0, geo_key.1
                 );
-                if let Err(e) = open::that(&w.current_path) {
+                let open_path = w.current_path.clone();
+                if let Err(e) = open::that(&open_path) {
                     eprintln!("Could not open file (continuing): {e}");
                 }
-                finalize_non_refresh_geocoded_file(w, folder, log)?;
-                try_close_preview_best_effort();
+                finalize_non_refresh_geocoded_file(w, folder, log, &mut last_description)?;
+                try_close_preview_best_effort(&open_path);
                 continue;
             }
         }
@@ -727,7 +795,8 @@ fn geocoded_interactive_place_desc_rename(
         }
         println!("Geoapify: {country} / {city}");
 
-        if let Err(e) = open::that(&w.current_path) {
+        let open_path = w.current_path.clone();
+        if let Err(e) = open::that(&open_path) {
             eprintln!("Could not open file (continuing): {e}");
         }
 
@@ -764,12 +833,12 @@ fn geocoded_interactive_place_desc_rename(
 
         if has_rest && sel == 3 {
             w.user_skip_rename = true;
-            try_close_preview_best_effort();
+            try_close_preview_best_effort(&open_path);
             continue;
         }
         if !has_rest && sel == 2 {
             w.user_skip_rename = true;
-            try_close_preview_best_effort();
+            try_close_preview_best_effort(&open_path);
             continue;
         }
 
@@ -795,15 +864,15 @@ fn geocoded_interactive_place_desc_rename(
                     bulk_for_same_geoapify.insert(from_geo, (c, ci));
                 }
             }
-            finalize_non_refresh_geocoded_file(w, folder, log)?;
+            finalize_non_refresh_geocoded_file(w, folder, log, &mut last_description)?;
         } else if has_rest && sel == 2 {
             auto_yes_same_geo = Some((country.clone(), city.clone()));
-            finalize_non_refresh_geocoded_file(w, folder, log)?;
+            finalize_non_refresh_geocoded_file(w, folder, log, &mut last_description)?;
         } else {
-            finalize_non_refresh_geocoded_file(w, folder, log)?;
+            finalize_non_refresh_geocoded_file(w, folder, log, &mut last_description)?;
         }
 
-        try_close_preview_best_effort();
+        try_close_preview_best_effort(&open_path);
     }
 
     Ok(())
@@ -946,6 +1015,12 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
             }
         }
     }
+
+    work.sort_by(|a, b| {
+        a.date_prefix
+            .cmp(&b.date_prefix)
+            .then_with(|| a.current_path.cmp(&b.current_path))
+    });
 
     let mut log = RenameLog::new(&folder);
 
@@ -1165,6 +1240,7 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
     }
     let mut last_country: Option<String> = None;
     let mut last_city: Option<String> = None;
+    let mut last_description: Option<String> = None;
     for w in &mut work {
         if w.already_named || w.place.is_some() || w.skip_session_date_mismatch {
             continue;
@@ -1177,7 +1253,8 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
             .to_string_lossy();
         println!("\n--- Manual [{manual_index}/{manual_total}] {name} ---");
 
-        if let Err(e) = open::that(&w.current_path) {
+        let open_path = w.current_path.clone();
+        if let Err(e) = open::that(&open_path) {
             eprintln!("Could not open file (continuing): {e}");
         }
 
@@ -1193,7 +1270,7 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         if action == 1 {
             w.user_skip_rename = true;
-            try_close_preview_best_effort();
+            try_close_preview_best_effort(&open_path);
             continue;
         }
 
@@ -1217,14 +1294,21 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
             w.stem_placeholders
                 .as_ref()
                 .and_then(|(_, _, d)| d.as_deref()),
+            last_description.as_deref(),
         )?;
+        if let Some(ref d) = desc_opt {
+            last_description = Some(d.clone());
+        }
         let stem = naming::build_stem(&w.date_prefix, &country, &city, desc_opt.as_deref());
         match try_rename_with_stem(&folder, w, &stem, &mut log) {
             Ok(()) => {
                 w.manual_flow_complete = true;
-                try_close_preview_best_effort();
+                try_close_preview_best_effort(&open_path);
             }
-            Err(e) => eprintln!("{e}"),
+            Err(e) => {
+                eprintln!("{e}");
+                try_close_preview_best_effort(&open_path);
+            }
         }
     }
 
@@ -1267,7 +1351,8 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
             .to_string_lossy();
         println!("\n--- {name} ---");
 
-        if let Err(e) = open::that(&w.current_path) {
+        let open_path = w.current_path.clone();
+        if let Err(e) = open::that(&open_path) {
             eprintln!("Could not open file (continuing): {e}");
         }
 
@@ -1297,7 +1382,11 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
             w.stem_placeholders
                 .as_ref()
                 .and_then(|(_, _, d)| d.as_deref()),
+            last_description.as_deref(),
         )?;
+        if let Some(ref d) = desc_opt {
+            last_description = Some(d.clone());
+        }
 
         let (country, city) = w
             .place
@@ -1306,8 +1395,11 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
         let stem_date = stem_date_for_final_rename(w);
         let stem = naming::build_stem(&stem_date, country, city, desc_opt.as_deref());
         match try_rename_with_stem(&folder, w, &stem, &mut log) {
-            Ok(()) => try_close_preview_best_effort(),
-            Err(e) => eprintln!("{e}"),
+            Ok(()) => try_close_preview_best_effort(&open_path),
+            Err(e) => {
+                eprintln!("{e}");
+                try_close_preview_best_effort(&open_path);
+            }
         }
     }
 
