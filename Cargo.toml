@@ -1,0 +1,17 @@
+[package]
+name = "img_reverse_geolocation"
+version = "0.1.0"
+edition = "2021"
+description = "Rename images/videos using GPS reverse geocoding or manual place names"
+
+[dependencies]
+dialoguer = "0.11"
+dotenvy = "0.15"
+exif = { package = "kamadak-exif", version = "0.6" }
+open = "5"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }

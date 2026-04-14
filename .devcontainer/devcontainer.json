@@ -1,0 +1,17 @@
+{
+  "name": "Rust (img-reverse-geolocation)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer"]
+    }
+  },
+  "remoteEnv": {
+    "GEOAPIFY_API_KEY": "${localEnv:GEOAPIFY_API_KEY}",
+    "CARGO_REGISTRIES_CRATES_IO_PROTOCOL": "sparse"
+  },
+  "postCreateCommand": "rustup component add rustfmt clippy || true"
+}

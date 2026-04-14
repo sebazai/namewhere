@@ -1,0 +1,5 @@
+# Build context is often the repo root; keep Docker uploads small.
+/target
+**/.git
+**/.tmp_run
+.env
