@@ -19,7 +19,7 @@ GPS and capture dates come from **EXIF** on images and from **ffprobe** (ffmpeg)
 
 - **Rust** (2021 edition toolchain; `cargo`, `rustc`)
 - **`ffprobe`** on your `PATH` (from [ffmpeg](https://ffmpeg.org/)) — needed for video location tags
-- **Geoapify API key** — optional for files *with* GPS. If `GEOAPIFY_API_KEY` is not set (and not in `.env`), the program prompts once when it hits the first file that has GPS (input is hidden). Press Enter to skip and fall back to manual place prompts for those files. The key is not saved; **each run** asks again unless the variable is set in the environment or `.env`.
+- **Geoapify API key** — optional for files *with* GPS. If `GEOAPIFY_API_KEY` is not set (and not in `.env`), the program prompts once **before** calling the API (after it knows how many GPS files need geocoding; input is hidden). Press Enter to skip and fall back to manual place prompts for those files. The key is not saved; **each run** asks again unless the variable is set in the environment or `.env`.
 
 ## Quick start
 
@@ -36,7 +36,9 @@ GPS and capture dates come from **EXIF** on images and from **ffprobe** (ffmpeg)
    cargo run --release
    ```
 
-The program is **interactive**: it asks for a folder (native picker when available, otherwise a path in the terminal), then year and month used as **`YYMM00`** when a file has no embedded date, then walks each media file in that folder.
+   Use `cargo run --release -- --help` for options (including `--folder DIR`). Environment variables are listed there as well.
+
+The program is **interactive**: it asks for a folder (native picker when available, otherwise a path in the terminal; empty folders can offer another pick), then **session year-month** in one line (e.g. `2026-04` or `26/4`; Enter defaults to today’s year-month) used as **`YYMM00`** when a file has no embedded date — after reporting how many files lack an embedded date. Successful renames are appended to **`img-reverse-geolocation-renames.csv`** in that folder (old path, new path, timestamp).
 
 ## Development
 
@@ -63,7 +65,7 @@ You still need **`ffprobe`** available inside the container (or on the host, dep
 | Path | Role |
 |------|------|
 | `src/main.rs` | Binary entrypoint |
-| `src/lib.rs` | Public `run()` entry |
+| `src/lib.rs` | Public `run(folder)` entry |
 | `src/flow.rs` | Folder pick, prompts, per-file rename loop |
 | `src/gps.rs` | GPS from EXIF / ffprobe |
 | `src/geoapify.rs` | Reverse geocoding HTTP client |
