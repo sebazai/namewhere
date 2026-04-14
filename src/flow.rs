@@ -23,6 +23,10 @@ fn load_dotenv() {
 /// is left untouched.
 const ENV_REFRESH_GEAPIFY_ONLY: &str = "IMG_REVERSE_GEO_REFRESH_GEAPIFY_ONLY";
 
+/// When `1` / `true` / `yes` / `on`, optional description prompts are skipped for files renamed
+/// from Geoapify (GPS) places. Manual no-GPS files and stem-place flows still use description prompts.
+const ENV_SKIP_GEOCODED_DESCRIPTIONS: &str = "IMG_REVERSE_GEO_SKIP_GEOCODED_DESCRIPTIONS";
+
 fn env_truthy(key: &str) -> bool {
     match env::var(key) {
         Ok(s) => {
@@ -451,6 +455,13 @@ fn needs_geocode_place_validation(w: &FileWork, refresh_geocoding_only: bool) ->
     }
 }
 
+/// Files that will go through `geocoded_interactive_place_desc_rename` (non-refresh).
+fn geocoded_review_count(work: &[FileWork]) -> usize {
+    work.iter()
+        .filter(|w| needs_geocode_place_validation(w, false))
+        .count()
+}
+
 fn stem_date_for_final_rename(w: &FileWork) -> String {
     if gps::capture_yymmdd(&w.current_path).is_some() {
         w.date_prefix.clone()
@@ -467,16 +478,22 @@ fn finalize_non_refresh_geocoded_file(
     folder: &Path,
     log: &mut RenameLog,
     last_description: &mut Option<String>,
+    skip_description: bool,
 ) -> Result<(), String> {
-    let desc_opt = prompt_optional_description(
-        w.stem_placeholders
-            .as_ref()
-            .and_then(|(_, _, d)| d.as_deref()),
-        last_description.as_deref(),
-    )?;
-    if let Some(ref d) = desc_opt {
-        *last_description = Some(d.clone());
-    }
+    let desc_opt = if skip_description {
+        None
+    } else {
+        let d = prompt_optional_description(
+            w.stem_placeholders
+                .as_ref()
+                .and_then(|(_, _, d)| d.as_deref()),
+            last_description.as_deref(),
+        )?;
+        if let Some(ref text) = d {
+            *last_description = Some(text.clone());
+        }
+        d
+    };
     let stem_date = stem_date_for_final_rename(w);
     let (country, city) = w
         .place
@@ -718,6 +735,7 @@ fn geocoded_interactive_place_desc_rename(
     work: &mut [FileWork],
     folder: &Path,
     log: &mut RenameLog,
+    skip_geocoded_descriptions: bool,
 ) -> Result<(), String> {
     let theme = ColorfulTheme::default();
     let mut to_review: Vec<usize> = work
@@ -739,8 +757,13 @@ fn geocoded_interactive_place_desc_rename(
     }
 
     println!(
-        "\n{} file(s) have place names from Geoapify (GPS). Confirm or edit each; then optional description; one rename per file.",
-        to_review.len()
+        "\n{} file(s) have place names from Geoapify (GPS). Confirm or edit each; {}one rename per file.",
+        to_review.len(),
+        if skip_geocoded_descriptions {
+            "no description segment — "
+        } else {
+            "then optional description; "
+        },
     );
     let do_review = Confirm::with_theme(&theme)
         .with_prompt("Review country/city for those files now?")
@@ -760,7 +783,13 @@ fn geocoded_interactive_place_desc_rename(
             if let Err(e) = open::that(&open_path) {
                 eprintln!("Could not open file (continuing): {e}");
             }
-            finalize_non_refresh_geocoded_file(w, folder, log, &mut last_description)?;
+            finalize_non_refresh_geocoded_file(
+                w,
+                folder,
+                log,
+                &mut last_description,
+                skip_geocoded_descriptions,
+            )?;
             try_close_preview_best_effort(&open_path);
         }
         return Ok(());
@@ -796,7 +825,13 @@ fn geocoded_interactive_place_desc_rename(
                     eprintln!("Could not open file (continuing): {e}");
                 }
                 w.place = Some((to_c.clone(), to_ci.clone()));
-                finalize_non_refresh_geocoded_file(w, folder, log, &mut last_description)?;
+                finalize_non_refresh_geocoded_file(
+                    w,
+                    folder,
+                    log,
+                    &mut last_description,
+                    skip_geocoded_descriptions,
+                )?;
                 try_close_preview_best_effort(&open_path);
                 continue;
             }
@@ -813,7 +848,13 @@ fn geocoded_interactive_place_desc_rename(
                 if let Err(e) = open::that(&open_path) {
                     eprintln!("Could not open file (continuing): {e}");
                 }
-                finalize_non_refresh_geocoded_file(w, folder, log, &mut last_description)?;
+                finalize_non_refresh_geocoded_file(
+                    w,
+                    folder,
+                    log,
+                    &mut last_description,
+                    skip_geocoded_descriptions,
+                )?;
                 try_close_preview_best_effort(&open_path);
                 continue;
             }
@@ -898,12 +939,30 @@ fn geocoded_interactive_place_desc_rename(
                     bulk_for_same_geoapify.insert(from_geo, (c, ci));
                 }
             }
-            finalize_non_refresh_geocoded_file(w, folder, log, &mut last_description)?;
+            finalize_non_refresh_geocoded_file(
+                w,
+                folder,
+                log,
+                &mut last_description,
+                skip_geocoded_descriptions,
+            )?;
         } else if has_rest && sel == 2 {
             auto_yes_same_geo = Some((country.clone(), city.clone()));
-            finalize_non_refresh_geocoded_file(w, folder, log, &mut last_description)?;
+            finalize_non_refresh_geocoded_file(
+                w,
+                folder,
+                log,
+                &mut last_description,
+                skip_geocoded_descriptions,
+            )?;
         } else {
-            finalize_non_refresh_geocoded_file(w, folder, log, &mut last_description)?;
+            finalize_non_refresh_geocoded_file(
+                w,
+                folder,
+                log,
+                &mut last_description,
+                skip_geocoded_descriptions,
+            )?;
         }
 
         try_close_preview_best_effort(&open_path);
@@ -1261,7 +1320,31 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
         return Ok(());
     }
 
-    geocoded_interactive_place_desc_rename(&mut work, &folder, &mut log)?;
+    let n_geo_review = geocoded_review_count(&work);
+    let skip_geocoded_descriptions = if n_geo_review == 0 {
+        false
+    } else if env_truthy(ENV_SKIP_GEOCODED_DESCRIPTIONS) {
+        println!(
+            "Optional descriptions skipped for Geoapify renames ({ENV_SKIP_GEOCODED_DESCRIPTIONS}=1; {n_geo_review} file(s))."
+        );
+        true
+    } else {
+        let theme = ColorfulTheme::default();
+        Confirm::with_theme(&theme)
+            .with_prompt(
+                "Skip optional descriptions for Geoapify renames? (Country/city only; files without GPS still get the description step.)",
+            )
+            .default(false)
+            .interact()
+            .map_err(|e| e.to_string())?
+    };
+
+    geocoded_interactive_place_desc_rename(
+        &mut work,
+        &folder,
+        &mut log,
+        skip_geocoded_descriptions,
+    )?;
 
     let manual_total = work
         .iter()

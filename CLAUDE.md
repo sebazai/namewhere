@@ -23,6 +23,7 @@ cargo fmt -- --check          # check formatting without writing
 
 - `ffprobe` (from ffmpeg) must be on `PATH` for GPS extraction from video files.
 - A `.env` file or `GEOAPIFY_API_KEY` enables automatic reverse geocoding without prompting. If unset, the first file with GPS triggers a one-time password-style prompt for the key (Enter skips geocoding for that run). Files without GPS still prompt for manual place names.
+- `IMG_REVERSE_GEO_SKIP_GEOCODED_DESCRIPTIONS=1` skips optional description prompts for Geoapify (GPS) renames; country/city-only stems. Files without GPS and stem-place flows still prompt for an optional description when applicable. Interactive runs also ask once (default: keep descriptions).
 
 ## Architecture
 
