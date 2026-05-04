@@ -29,8 +29,9 @@ cargo fmt -- --check          # check formatting without writing
 
 The program has a straightforward linear flow through these modules:
 
-- **`flow.rs`** — top-level orchestration. Picks a folder via native dialog or terminal prompt, collects media files, prompts for year/month (fallback **`YYMM00`** when no embedded date), then iterates each file: opens it, reads GPS, calls Geoapify or prompts for manual input, builds a filename stem, and renames.
-- **`gps.rs`** — GPS and capture date: `coordinates()` from EXIF / ffprobe; `capture_yymmdd()` from EXIF DateTime* tags or ffprobe `creation_time` / similar. Images prefer EXIF; videos prefer ffprobe.
+<!-- - **`flow.rs`** — top-level orchestration. Picks a folder via native dialog or terminal prompt, collects media files, prompts for year/month (fallback **`YYMM00`** when no embedded date), then iterates each file: opens it, reads GPS, calls Geoapify or prompts for manual input, builds a filename stem, and renames. -->
+
+- **`gps.rs`** — GPS and capture date: `coordinates()` from EXIF / ffprobe; `capture_yymmdd()` from EXIF DateTime\* tags or ffprobe `creation_time` / similar. Images prefer EXIF; videos prefer ffprobe.
 - **`geoapify.rs`** — blocking HTTP call to `https://api.geoapify.com/v1/geocode/reverse`. Returns `(country, city)`. City falls back through `city → name → county → formatted` fields.
 - **`naming.rs`** — filename construction. `sanitize_segment()` replaces unsafe characters with `-`. `build_stem()` produces `YYMMDD-Country-City[-Description]` (capped at 180 chars). `classify_tool_stem()` accepts legacy 4-digit or 6-digit date prefixes; `normalize_date_prefix_for_stem()` maps `YYMM` → `YYMM00`. `unique_target_path()` appends `-2`, `-3`, … to avoid collisions.
 - **`media.rs`** — non-recursive directory scan returning sorted `Vec<PathBuf>` of files with recognized extensions.

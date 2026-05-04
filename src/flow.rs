@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,6 +13,7 @@ use crate::geoapify;
 use crate::gps;
 use crate::media;
 use crate::naming;
+use crate::{RenameFlowMode, RunOptions};
 
 fn load_dotenv() {
     let _ = dotenvy::dotenv();
@@ -27,6 +28,25 @@ const ENV_REFRESH_GEAPIFY_ONLY: &str = "IMG_REVERSE_GEO_REFRESH_GEAPIFY_ONLY";
 /// from Geoapify (GPS) places. Manual no-GPS files and stem-place flows still use description prompts.
 const ENV_SKIP_GEOCODED_DESCRIPTIONS: &str = "IMG_REVERSE_GEO_SKIP_GEOCODED_DESCRIPTIONS";
 
+/// `full` (default), `place-date`, or `autonomous` — when `--mode` is not set.
+/// Ignored if [`RenameFlowMode`] is passed from the CLI.
+const ENV_FLOW_MODE: &str = "IMG_REVERSE_GEO_FLOW";
+
+const ENV_SESSION_YM: &str = "IMG_REVERSE_GEO_SESSION";
+const ENV_FALLBACK_COUNTRY: &str = "IMG_REVERSE_GEO_FALLBACK_COUNTRY";
+const ENV_FALLBACK_CITY: &str = "IMG_REVERSE_GEO_FALLBACK_CITY";
+
+/// Resolves a user-supplied path relative to the process current directory (where you ran the command).
+fn resolve_path_from_cwd(p: PathBuf) -> Result<PathBuf, String> {
+    Ok(if p.is_absolute() {
+        p
+    } else {
+        env::current_dir()
+            .map_err(|e| format!("Could not read working directory: {e}"))?
+            .join(p)
+    })
+}
+
 fn env_truthy(key: &str) -> bool {
     match env::var(key) {
         Ok(s) => {
@@ -35,6 +55,65 @@ fn env_truthy(key: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Carriage-return status on stderr so stdout logs stay readable.
+fn stderr_progress_line(done: usize, total: usize, label: &str) {
+    if total == 0 {
+        return;
+    }
+    let step = if total <= 20 { 1 } else { (total / 25).max(5) };
+    if done == 1 || done == total || done.is_multiple_of(step) {
+        eprint!("\r  {label} {done}/{total}");
+        let _ = std::io::stderr().flush();
+    }
+}
+
+fn stderr_progress_finish() {
+    eprintln!();
+}
+
+/// CLI wins, then env. Returns `None` when the user should be asked interactively (after folder pick).
+fn flow_mode_from_cli_or_env(
+    cli: Option<RenameFlowMode>,
+) -> Result<Option<RenameFlowMode>, String> {
+    if let Some(m) = cli {
+        return Ok(Some(m));
+    }
+    if let Ok(raw) = env::var(ENV_FLOW_MODE) {
+        let t = raw.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            return Ok(Some(RenameFlowMode::Full));
+        }
+        return match t.as_str() {
+            "full" => Ok(Some(RenameFlowMode::Full)),
+            "place-date" | "place_date" | "placedate" => Ok(Some(RenameFlowMode::PlaceDateOnly)),
+            "autonomous" | "auto" => Ok(Some(RenameFlowMode::Autonomous)),
+            _ => Err(format!(
+                "{ENV_FLOW_MODE}: invalid value {raw:?} (expected full, place-date, or autonomous)"
+            )),
+        };
+    }
+    Ok(None)
+}
+
+fn prompt_flow_mode() -> Result<RenameFlowMode, String> {
+    let theme = ColorfulTheme::default();
+    let sel = Select::with_theme(&theme)
+        .with_prompt("Rename flow")
+        .items(&[
+            "Full — review each Geoapify place & optional descriptions".to_string(),
+            "Place & date only — YYMMDD-Country-City, auto-apply GPS places (no descriptions)"
+                .to_string(),
+        ])
+        .default(0)
+        .interact()
+        .map_err(|e| e.to_string())?;
+    Ok(if sel == 0 {
+        RenameFlowMode::Full
+    } else {
+        RenameFlowMode::PlaceDateOnly
+    })
 }
 
 const RENAME_LOG_FILENAME: &str = "img-reverse-geolocation-renames.csv";
@@ -104,6 +183,7 @@ fn pick_folder() -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())?;
 
     let path = PathBuf::from(raw.trim());
+    let path = resolve_path_from_cwd(path)?;
     if !path.is_dir() {
         return Err(format!("Not a directory: {}", path.display()));
     }
@@ -112,6 +192,7 @@ fn pick_folder() -> Result<PathBuf, String> {
 
 fn resolve_folder(cli_folder: Option<PathBuf>) -> Result<PathBuf, String> {
     if let Some(p) = cli_folder {
+        let p = resolve_path_from_cwd(p)?;
         if !p.is_dir() {
             return Err(format!("Not a directory: {}", p.display()));
         }
@@ -187,6 +268,87 @@ fn parse_session_year_month() -> Result<(String, String), String> {
         return Ok((yy, mm));
     }
     parse_combined_year_month(line)
+}
+
+fn optional_trim_nonempty(s: Option<&str>) -> Option<String> {
+    s.and_then(|t| {
+        let t = t.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    })
+}
+
+fn resolve_session_yy_mm(
+    flow_mode: RenameFlowMode,
+    cli_session: Option<&str>,
+) -> Result<(String, String), String> {
+    if flow_mode == RenameFlowMode::Autonomous {
+        if let Some(s) = optional_trim_nonempty(cli_session) {
+            return parse_combined_year_month(&s);
+        }
+        if let Ok(env_s) = env::var(ENV_SESSION_YM) {
+            let t = env_s.trim();
+            if !t.is_empty() {
+                return parse_combined_year_month(t);
+            }
+        }
+        if std::io::stdin().is_terminal() {
+            return parse_session_year_month();
+        }
+        return Err(format!(
+            "Autonomous mode: pass --session-year-month (e.g. 2026-05) or set {ENV_SESSION_YM}"
+        ));
+    }
+    parse_session_year_month()
+}
+
+fn resolve_autonomous_fallback(
+    cli_country: Option<&str>,
+    cli_city: Option<&str>,
+) -> Result<(String, String), String> {
+    let country = optional_trim_nonempty(cli_country)
+        .or_else(|| optional_trim_nonempty(env::var(ENV_FALLBACK_COUNTRY).ok().as_deref()));
+    let city = optional_trim_nonempty(cli_city)
+        .or_else(|| optional_trim_nonempty(env::var(ENV_FALLBACK_CITY).ok().as_deref()));
+    if let (Some(c), Some(ci)) = (country, city) {
+        return Ok((c, ci));
+    }
+    if std::io::stdin().is_terminal() {
+        return prompt_fallback_country_city();
+    }
+    Err(format!(
+        "Autonomous mode: pass --fallback-country and --fallback-city or set {ENV_FALLBACK_COUNTRY} and {ENV_FALLBACK_CITY}"
+    ))
+}
+
+fn prompt_fallback_country_city() -> Result<(String, String), String> {
+    let theme = ColorfulTheme::default();
+    let country = loop {
+        let raw: String = Input::with_theme(&theme)
+            .with_prompt("Fallback country (for files with no GPS)")
+            .interact_text()
+            .map_err(|e| e.to_string())?;
+        let t = raw.trim();
+        if !t.is_empty() {
+            break t.to_string();
+        }
+        eprintln!("Country cannot be empty.");
+    };
+    let city = loop {
+        let raw: String = Input::with_theme(&theme)
+            .with_prompt("Fallback city (for files with no GPS)")
+            .interact_text()
+            .map_err(|e| e.to_string())?;
+        let t = raw.trim();
+        if !t.is_empty() {
+            break t.to_string();
+        }
+        eprintln!("City cannot be empty.");
+    };
+    Ok((country, city))
 }
 
 /// After year/month: optionally ignore existing tool-style filenames and run GPS + Geoapify for every
@@ -423,9 +585,14 @@ fn geoapify_candidate_count(
     work: &[FileWork],
     force_full_rerun: bool,
     refresh_geocoding_only: bool,
+    progress_label: Option<&str>,
 ) -> usize {
+    let total = work.len();
     let mut n = 0;
-    for w in work {
+    for (i, w) in work.iter().enumerate() {
+        if let Some(lbl) = progress_label {
+            stderr_progress_line(i + 1, total, lbl);
+        }
         if !force_full_rerun && w.skip_session_date_mismatch {
             continue;
         }
@@ -440,6 +607,9 @@ fn geoapify_candidate_count(
             continue;
         }
         n += 1;
+    }
+    if progress_label.is_some() {
+        stderr_progress_finish();
     }
     n
 }
@@ -537,6 +707,7 @@ fn refresh_place_review_and_rename(
     work: &mut [FileWork],
     folder: &Path,
     log: &mut RenameLog,
+    flow_mode: RenameFlowMode,
 ) -> Result<(), String> {
     let theme = ColorfulTheme::default();
     let mut to_review: Vec<usize> = work
@@ -554,6 +725,24 @@ fn refresh_place_review_and_rename(
     });
 
     if to_review.is_empty() {
+        return Ok(());
+    }
+
+    if matches!(
+        flow_mode,
+        RenameFlowMode::PlaceDateOnly | RenameFlowMode::Autonomous
+    ) {
+        println!(
+            "\n{} file(s) (refresh mode): applying Geoapify country/city without per-file review.",
+            to_review.len()
+        );
+        for &idx in &to_review {
+            let w = &mut work[idx];
+            if w.user_skip_rename {
+                continue;
+            }
+            try_refresh_rename_one(w, folder, log)?;
+        }
         return Ok(());
     }
 
@@ -735,6 +924,7 @@ fn geocoded_interactive_place_desc_rename(
     work: &mut [FileWork],
     folder: &Path,
     log: &mut RenameLog,
+    flow_mode: RenameFlowMode,
     skip_geocoded_descriptions: bool,
 ) -> Result<(), String> {
     let theme = ColorfulTheme::default();
@@ -753,6 +943,25 @@ fn geocoded_interactive_place_desc_rename(
     });
 
     if to_review.is_empty() {
+        return Ok(());
+    }
+
+    if matches!(
+        flow_mode,
+        RenameFlowMode::PlaceDateOnly | RenameFlowMode::Autonomous
+    ) {
+        println!(
+            "\n{} file(s): applying Geoapify country/city without per-file review (no description segment).",
+            to_review.len()
+        );
+        let mut last_description = None;
+        for &idx in &to_review {
+            let w = &mut work[idx];
+            if w.user_skip_rename {
+                continue;
+            }
+            finalize_non_refresh_geocoded_file(w, folder, log, &mut last_description, true)?;
+        }
         return Ok(());
     }
 
@@ -1004,8 +1213,17 @@ fn try_rename_with_stem(
     Ok(())
 }
 
-pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
+pub fn run(opts: RunOptions) -> Result<(), String> {
     load_dotenv();
+
+    let RunOptions {
+        folder: cli_folder,
+        folder_from_cli,
+        flow_mode: flow_mode_cli,
+        session_year_month,
+        fallback_country,
+        fallback_city,
+    } = opts;
 
     let refresh_geocoding_only = env_truthy(ENV_REFRESH_GEAPIFY_ONLY);
     if refresh_geocoding_only {
@@ -1015,6 +1233,27 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
     }
 
     let folder = resolve_folder(cli_folder)?;
+    let flow_mode = match flow_mode_from_cli_or_env(flow_mode_cli)? {
+        Some(m) => m,
+        None => {
+            if std::io::stdin().is_terminal() {
+                prompt_flow_mode()?
+            } else {
+                RenameFlowMode::Full
+            }
+        }
+    };
+    if flow_mode == RenameFlowMode::Autonomous {
+        if !folder_from_cli {
+            return Err(
+                "Autonomous mode requires --folder (pick a path on the command line; no folder dialog)."
+                    .to_string(),
+            );
+        }
+        println!("Flow: autonomous — after session/fallback configuration, no more prompts. Files without GPS use the fallback country/city (YYMMDD from EXIF or session YYMM00).");
+    } else if flow_mode == RenameFlowMode::PlaceDateOnly {
+        println!("Flow: place & date only (YYMMDD-Country-City; no optional descriptions; Geoapify applied without per-file confirmation).");
+    }
     let files = media::list_media_files(&folder)?;
 
     let mut work: Vec<FileWork> = Vec::new();
@@ -1041,7 +1280,7 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
         return Err("No processable media files (all missing extensions?).".to_string());
     }
 
-    let force_full_rerun = if refresh_geocoding_only {
+    let force_full_rerun = if refresh_geocoding_only || flow_mode == RenameFlowMode::Autonomous {
         false
     } else {
         prompt_force_full_rerun()?
@@ -1080,21 +1319,36 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
         }
     }
 
-    let missing_embedded = work
-        .iter()
-        .filter(|w| gps::capture_yymmdd(&w.current_path).is_none())
-        .count();
-    if missing_embedded > 0 {
-        println!(
-            "{missing_embedded} file(s) have no embedded capture date; session fallback YYMM00 will be used for those."
-        );
-    }
-    let (yy, mm) = parse_session_year_month()?;
+    println!("Found {} media file(s).", work.len());
+    let _ = std::io::stdout().flush();
+
+    let (yy, mm) = resolve_session_yy_mm(flow_mode, session_year_month.as_deref())?;
     let yymm = format!("{yy}{mm}");
     let fallback_yymmdd = format!("{yymm}00");
 
-    for w in &mut work {
+    let autonomous_fallback = if flow_mode == RenameFlowMode::Autonomous && !refresh_geocoding_only
+    {
+        Some(resolve_autonomous_fallback(
+            fallback_country.as_deref(),
+            fallback_city.as_deref(),
+        )?)
+    } else {
+        None
+    };
+
+    println!(
+        "Reading embedded capture dates (EXIF / video metadata; many or large files can take several minutes)…"
+    );
+    let _ = std::io::stdout().flush();
+
+    let total_files = work.len();
+    let mut missing_embedded = 0usize;
+    for (i, w) in work.iter_mut().enumerate() {
+        stderr_progress_line(i + 1, total_files, "Capture dates");
         let exif_or_video_date = gps::capture_yymmdd(&w.current_path);
+        if exif_or_video_date.is_none() {
+            missing_embedded += 1;
+        }
         w.date_prefix = exif_or_video_date
             .clone()
             .unwrap_or_else(|| fallback_yymmdd.clone());
@@ -1107,6 +1361,13 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
                 }
             }
         }
+    }
+    stderr_progress_finish();
+
+    if missing_embedded > 0 {
+        println!(
+            "{missing_embedded} file(s) have no embedded capture date; session fallback YYMM00 will be used for those."
+        );
     }
 
     work.sort_by(|a, b| {
@@ -1262,12 +1523,28 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
     println!("\nReading GPS and calling Geoapify where needed (videos can be slow)…");
     let _ = std::io::stdout().flush();
 
-    let geoapify_total = geoapify_candidate_count(&work, force_full_rerun, refresh_geocoding_only);
+    let gps_scan_label = if work.len() > 3 {
+        Some("GPS metadata scan")
+    } else {
+        None
+    };
+    let geoapify_total = geoapify_candidate_count(
+        &work,
+        force_full_rerun,
+        refresh_geocoding_only,
+        gps_scan_label,
+    );
+    println!("  {geoapify_total} file(s) with coordinates to reverse-geocode.");
     let mut api_key = env::var("GEOAPIFY_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty())
         .map(|k| k.trim().to_string());
     if geoapify_total > 0 && api_key.is_none() {
+        if flow_mode == RenameFlowMode::Autonomous {
+            return Err(format!(
+                "Autonomous mode: {geoapify_total} file(s) have GPS — set GEOAPIFY_API_KEY in the environment."
+            ));
+        }
         println!(
             "{geoapify_total} file(s) have GPS and can be reverse-geocoded with a Geoapify API key."
         );
@@ -1315,34 +1592,47 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
     println!("Done GPS / geocode pass.");
 
     if refresh_geocoding_only {
-        refresh_place_review_and_rename(&mut work, &folder, &mut log)?;
+        refresh_place_review_and_rename(&mut work, &folder, &mut log, flow_mode)?;
         println!("Done refresh-only run.");
         return Ok(());
     }
 
     let n_geo_review = geocoded_review_count(&work);
-    let skip_geocoded_descriptions = if n_geo_review == 0 {
-        false
-    } else if env_truthy(ENV_SKIP_GEOCODED_DESCRIPTIONS) {
-        println!(
-            "Optional descriptions skipped for Geoapify renames ({ENV_SKIP_GEOCODED_DESCRIPTIONS}=1; {n_geo_review} file(s))."
-        );
-        true
-    } else {
-        let theme = ColorfulTheme::default();
-        Confirm::with_theme(&theme)
-            .with_prompt(
-                "Skip optional descriptions for Geoapify renames? (Country/city only; files without GPS still get the description step.)",
-            )
-            .default(false)
-            .interact()
-            .map_err(|e| e.to_string())?
+    let skip_geocoded_descriptions = match flow_mode {
+        RenameFlowMode::PlaceDateOnly | RenameFlowMode::Autonomous => {
+            if n_geo_review > 0 {
+                println!(
+                    "Optional descriptions skipped for Geoapify renames ({n_geo_review} file(s))."
+                );
+            }
+            true
+        }
+        RenameFlowMode::Full => {
+            if n_geo_review == 0 {
+                false
+            } else if env_truthy(ENV_SKIP_GEOCODED_DESCRIPTIONS) {
+                println!(
+                    "Optional descriptions skipped for Geoapify renames ({ENV_SKIP_GEOCODED_DESCRIPTIONS}=1; {n_geo_review} file(s))."
+                );
+                true
+            } else {
+                let theme = ColorfulTheme::default();
+                Confirm::with_theme(&theme)
+                    .with_prompt(
+                        "Skip optional descriptions for Geoapify renames? (Country/city only; files without GPS still get the description step.)",
+                    )
+                    .default(false)
+                    .interact()
+                    .map_err(|e| e.to_string())?
+            }
+        }
     };
 
     geocoded_interactive_place_desc_rename(
         &mut work,
         &folder,
         &mut log,
+        flow_mode,
         skip_geocoded_descriptions,
     )?;
 
@@ -1353,7 +1643,19 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
     let mut manual_index = 0_usize;
 
     if manual_total > 0 {
-        println!("\n--- Files without GPS / geocoding: place + optional description ---");
+        match flow_mode {
+            RenameFlowMode::Autonomous => {
+                println!(
+                    "\n--- Files without GPS / geocoding: fallback country & city (autonomous) ---"
+                );
+            }
+            RenameFlowMode::PlaceDateOnly => {
+                println!("\n--- Files without GPS / geocoding: country & city (place-date-only: no description) ---");
+            }
+            RenameFlowMode::Full => {
+                println!("\n--- Files without GPS / geocoding: place + optional description ---");
+            }
+        }
     }
     let mut last_country: Option<String> = None;
     let mut last_city: Option<String> = None;
@@ -1371,51 +1673,73 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
         println!("\n--- Manual [{manual_index}/{manual_total}] {name} ---");
 
         let open_path = w.current_path.clone();
-        if let Err(e) = open::that(&open_path) {
-            eprintln!("Could not open file (continuing): {e}");
-        }
 
-        let theme = ColorfulTheme::default();
-        let action = Select::with_theme(&theme)
-            .with_prompt("This file has no GPS in metadata")
-            .items(&[
-                "Add country, city & description".to_string(),
-                "Skip — leave filename unchanged".to_string(),
-            ])
-            .default(0)
-            .interact()
-            .map_err(|e| e.to_string())?;
-        if action == 1 {
-            w.user_skip_rename = true;
-            try_close_preview_best_effort(&open_path);
-            continue;
-        }
+        let (country, city, desc_opt) = if flow_mode == RenameFlowMode::Autonomous {
+            let (fc, fci) = autonomous_fallback
+                .clone()
+                .ok_or_else(|| "internal: autonomous mode missing fallback place".to_string())?;
+            println!("No GPS — using fallback place: {fc} / {fci}");
+            w.place = Some((fc.clone(), fci.clone()));
+            (fc, fci, None)
+        } else {
+            if let Err(e) = open::that(&open_path) {
+                eprintln!("Could not open file (continuing): {e}");
+            }
 
-        let country = prompt_place_line(
-            "Country",
-            last_country
-                .as_deref()
-                .or_else(|| w.stem_placeholders.as_ref().map(|s| s.0.as_str())),
-        )?;
-        let city = prompt_place_line(
-            "City",
-            last_city
-                .as_deref()
-                .or_else(|| w.stem_placeholders.as_ref().map(|s| s.1.as_str())),
-        )?;
-        last_country = Some(country.clone());
-        last_city = Some(city.clone());
-        w.place = Some((country.clone(), city.clone()));
+            let theme = ColorfulTheme::default();
+            let add_place_label = if flow_mode == RenameFlowMode::PlaceDateOnly {
+                "Add country & city"
+            } else {
+                "Add country, city & description"
+            };
+            let action = Select::with_theme(&theme)
+                .with_prompt("This file has no GPS in metadata")
+                .items(&[
+                    add_place_label.to_string(),
+                    "Skip — leave filename unchanged".to_string(),
+                ])
+                .default(0)
+                .interact()
+                .map_err(|e| e.to_string())?;
+            if action == 1 {
+                w.user_skip_rename = true;
+                try_close_preview_best_effort(&open_path);
+                continue;
+            }
 
-        let desc_opt = prompt_optional_description(
-            w.stem_placeholders
-                .as_ref()
-                .and_then(|(_, _, d)| d.as_deref()),
-            last_description.as_deref(),
-        )?;
-        if let Some(ref d) = desc_opt {
-            last_description = Some(d.clone());
-        }
+            let country = prompt_place_line(
+                "Country",
+                last_country
+                    .as_deref()
+                    .or_else(|| w.stem_placeholders.as_ref().map(|s| s.0.as_str())),
+            )?;
+            let city = prompt_place_line(
+                "City",
+                last_city
+                    .as_deref()
+                    .or_else(|| w.stem_placeholders.as_ref().map(|s| s.1.as_str())),
+            )?;
+            last_country = Some(country.clone());
+            last_city = Some(city.clone());
+            w.place = Some((country.clone(), city.clone()));
+
+            let desc_opt = if flow_mode == RenameFlowMode::PlaceDateOnly {
+                None
+            } else {
+                let d = prompt_optional_description(
+                    w.stem_placeholders
+                        .as_ref()
+                        .and_then(|(_, _, d)| d.as_deref()),
+                    last_description.as_deref(),
+                )?;
+                if let Some(ref text) = d {
+                    last_description = Some(text.clone());
+                }
+                d
+            };
+            (country, city, desc_opt)
+        };
+
         let stem = naming::build_stem(&w.date_prefix, &country, &city, desc_opt.as_deref());
         match try_rename_with_stem(&folder, w, &stem, &mut log) {
             Ok(()) => {
@@ -1441,12 +1765,19 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
         })
         .count();
     if stem_total > 0 {
-        println!(
-            "\n--- Stem place + description (country/city from filename; optional description) ---"
-        );
-        println!(
-            "Tip: if the filename used a POI or building number as city, edit before the description."
-        );
+        if matches!(
+            flow_mode,
+            RenameFlowMode::PlaceDateOnly | RenameFlowMode::Autonomous
+        ) {
+            println!("\n--- Stem place (country/city from filename, no description) ---");
+        } else {
+            println!(
+                "\n--- Stem place + description (country/city from filename; optional description) ---"
+            );
+            println!(
+                "Tip: if the filename used a POI or building number as city, edit before the description."
+            );
+        }
     }
     let stem_theme = ColorfulTheme::default();
     for w in &mut work {
@@ -1469,41 +1800,53 @@ pub fn run(cli_folder: Option<PathBuf>) -> Result<(), String> {
         println!("\n--- {name} ---");
 
         let open_path = w.current_path.clone();
-        if let Err(e) = open::that(&open_path) {
-            eprintln!("Could not open file (continuing): {e}");
+        if flow_mode != RenameFlowMode::Autonomous {
+            if let Err(e) = open::that(&open_path) {
+                eprintln!("Could not open file (continuing): {e}");
+            }
         }
 
         println!("Place from filename: {country} / {city}");
-        let keep = Confirm::with_theme(&stem_theme)
-            .with_prompt("Keep this country & city in the filename? (No = edit)")
-            .default(true)
-            .interact()
-            .map_err(|e| e.to_string())?;
-        if !keep {
-            let def_c = w
-                .stem_placeholders
-                .as_ref()
-                .map(|s| s.0.as_str())
-                .unwrap_or(country.as_str());
-            let def_ci = w
-                .stem_placeholders
-                .as_ref()
-                .map(|s| s.1.as_str())
-                .unwrap_or(city.as_str());
-            let c = prompt_place_line("Country", Some(def_c))?;
-            let ci = prompt_place_line("City", Some(def_ci))?;
-            w.place = Some((c, ci));
+        if flow_mode == RenameFlowMode::Full {
+            let keep = Confirm::with_theme(&stem_theme)
+                .with_prompt("Keep this country & city in the filename? (No = edit)")
+                .default(true)
+                .interact()
+                .map_err(|e| e.to_string())?;
+            if !keep {
+                let def_c = w
+                    .stem_placeholders
+                    .as_ref()
+                    .map(|s| s.0.as_str())
+                    .unwrap_or(country.as_str());
+                let def_ci = w
+                    .stem_placeholders
+                    .as_ref()
+                    .map(|s| s.1.as_str())
+                    .unwrap_or(city.as_str());
+                let c = prompt_place_line("Country", Some(def_c))?;
+                let ci = prompt_place_line("City", Some(def_ci))?;
+                w.place = Some((c, ci));
+            }
         }
 
-        let desc_opt = prompt_optional_description(
-            w.stem_placeholders
-                .as_ref()
-                .and_then(|(_, _, d)| d.as_deref()),
-            last_description.as_deref(),
-        )?;
-        if let Some(ref d) = desc_opt {
-            last_description = Some(d.clone());
-        }
+        let desc_opt = if matches!(
+            flow_mode,
+            RenameFlowMode::PlaceDateOnly | RenameFlowMode::Autonomous
+        ) {
+            None
+        } else {
+            let d = prompt_optional_description(
+                w.stem_placeholders
+                    .as_ref()
+                    .and_then(|(_, _, d)| d.as_deref()),
+                last_description.as_deref(),
+            )?;
+            if let Some(ref text) = d {
+                last_description = Some(text.clone());
+            }
+            d
+        };
 
         let (country, city) = w
             .place
